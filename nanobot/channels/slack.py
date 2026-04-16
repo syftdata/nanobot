@@ -1,7 +1,8 @@
-"""Slack channel implementation using Socket Mode."""
+"""Slack channel implementation using Socket Mode or Webhook."""
 
 import asyncio
 import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,9 @@ class SlackConfig(Base):
     enabled: bool = False
     mode: str = "socket"
     webhook_path: str = "/slack/events"
+    webhook_host: str = "127.0.0.1"
+    webhook_port: int = 18800
+    webhook_secret: str = ""
     bot_token: str = ""
     app_token: str = ""
     user_token_read_only: bool = True
@@ -44,6 +48,7 @@ class SlackConfig(Base):
     done_emoji: str = "white_check_mark"
     include_thread_context: bool = True
     thread_context_limit: int = 20
+    typing_status: str = ""
     allow_from: list[str] = Field(default_factory=list)
     group_policy: str = "mention"
     group_allow_from: list[str] = Field(default_factory=list)
@@ -84,37 +89,47 @@ class SlackChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: SlackConfig = config
         self._web_client: AsyncWebClient | None = None
-        self._socket_client: SocketModeClient | None = None
+        self._socket_client: Any | None = None
         self._bot_user_id: str | None = None
         self._target_cache: dict[str, str] = {}
         self._thread_context_attempted: set[str] = set()
+        self._webhook_runner: Any | None = None
+        self._mention_threads: OrderedDict[str, None] = OrderedDict()
 
     async def start(self) -> None:
-        """Start the Slack Socket Mode client."""
-        if not self.config.bot_token or not self.config.app_token:
-            self.logger.error("bot/app token not configured")
-            return
-        if self.config.mode != "socket":
-            self.logger.error("Unsupported mode: {}", self.config.mode)
+        """Start the Slack channel in the configured mode (socket or webhook)."""
+        if not self.config.bot_token:
+            self.logger.error("bot_token not configured")
             return
 
         self._running = True
-
         self._web_client = AsyncWebClient(token=self.config.bot_token)
-        self._socket_client = SocketModeClient(
-            app_token=self.config.app_token,
-            web_client=self._web_client,
-        )
 
-        self._socket_client.socket_mode_request_listeners.append(self._on_socket_request)
-
-        # Resolve bot user ID for mention handling
         try:
             auth = await self._web_client.auth_test()
             self._bot_user_id = auth.get("user_id")
             self.logger.info("bot connected as {}", self._bot_user_id)
         except Exception as e:
             self.logger.warning("auth_test failed: {}", e)
+
+        if self.config.mode == "socket":
+            await self._start_socket_mode()
+        elif self.config.mode == "webhook":
+            await self._start_webhook_server()
+        else:
+            self.logger.error("Unsupported mode: {}", self.config.mode)
+
+    async def _start_socket_mode(self) -> None:
+        """Connect via Socket Mode (original behavior)."""
+        if not self.config.app_token:
+            self.logger.error("app_token required for socket mode")
+            return
+
+        self._socket_client = SocketModeClient(
+            app_token=self.config.app_token,
+            web_client=self._web_client,
+        )
+        self._socket_client.socket_mode_request_listeners.append(self._on_socket_request)
 
         self.logger.info("Starting Socket Mode client...")
         try:
@@ -138,6 +153,55 @@ class SlackChannel(BaseChannel):
         while self._running:
             await asyncio.sleep(1)
 
+    async def _start_webhook_server(self) -> None:
+        """Start an HTTP server that accepts event payloads from the event router."""
+        try:
+            from aiohttp import web
+        except ImportError:
+            self.logger.error(
+                "aiohttp is required for webhook mode: pip install nanobot-ai[api]"
+            )
+            return
+
+        async def handle_event(request: web.Request) -> web.Response:
+            if self.config.webhook_secret:
+                auth_header = request.headers.get("Authorization", "")
+                if auth_header != f"Bearer {self.config.webhook_secret}":
+                    return web.Response(status=401, text="Unauthorized")
+            try:
+                payload = await request.json()
+            except Exception:
+                return web.Response(status=400, text="Invalid JSON")
+            asyncio.create_task(self._process_slack_event(payload))
+            return web.Response(status=200, text="ok")
+
+        async def handle_health(_: web.Request) -> web.Response:
+            return web.Response(
+                text='{"status":"ok"}',
+                content_type="application/json",
+            )
+
+        app = web.Application()
+        app.router.add_post(self.config.webhook_path, handle_event)
+        app.router.add_get("/health", handle_health)
+
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        self._webhook_runner = runner
+        site = web.TCPSite(runner, self.config.webhook_host, self.config.webhook_port)
+        await site.start()
+        self.logger.info(
+            "Slack webhook server listening on {}:{}{}",
+            self.config.webhook_host,
+            self.config.webhook_port,
+            self.config.webhook_path,
+        )
+
+        while self._running:
+            await asyncio.sleep(1)
+
+        await runner.cleanup()
+
     async def stop(self) -> None:
         """Stop the Slack client."""
         self._running = False
@@ -147,6 +211,12 @@ class SlackChannel(BaseChannel):
             except Exception as e:
                 self.logger.warning("socket close failed: {}", e)
             self._socket_client = None
+        if self._webhook_runner:
+            try:
+                await self._webhook_runner.cleanup()
+            except Exception as e:
+                self.logger.warning("webhook runner cleanup failed: {}", e)
+            self._webhook_runner = None
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Slack."""
@@ -311,8 +381,8 @@ class SlackChannel(BaseChannel):
 
     async def _on_socket_request(
         self,
-        client: SocketModeClient,
-        req: SocketModeRequest,
+        client: Any,
+        req: Any,
     ) -> None:
         """Handle incoming Socket Mode requests."""
         if req.type == "interactive":
@@ -321,16 +391,17 @@ class SlackChannel(BaseChannel):
         if req.type != "events_api":
             return
 
-        # Acknowledge right away
         await client.send_socket_mode_response(
             SocketModeResponse(envelope_id=req.envelope_id)
         )
 
-        payload = req.payload or {}
+        await self._process_slack_event(req.payload or {})
+
+    async def _process_slack_event(self, payload: dict) -> None:
+        """Process a Slack event payload (shared by socket and webhook modes)."""
         event = payload.get("event") or {}
         event_type = event.get("type")
 
-        # Handle app mentions or plain messages
         if event_type not in ("message", "app_mention"):
             return
 
@@ -345,8 +416,6 @@ class SlackChannel(BaseChannel):
         if self._bot_user_id and sender_id == self._bot_user_id:
             return
 
-        # Avoid double-processing: Slack sends both `message` and `app_mention`
-        # for mentions in channels. Prefer `app_mention`.
         text = event.get("text") or ""
         if event_type == "message" and self._bot_user_id and f"<@{self._bot_user_id}>" in text:
             return
@@ -376,8 +445,17 @@ class SlackChannel(BaseChannel):
                 )
             return
 
-        if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id):
+        event_thread_ts = event.get("thread_ts")
+
+        if channel_type != "im" and not self._should_respond_in_channel(
+            event_type, text, chat_id, thread_ts=event_thread_ts,
+        ):
             return
+
+        if event_type == "app_mention":
+            thread_key = event_thread_ts or event.get("ts")
+            if thread_key:
+                self._track_mention_thread(thread_key)
 
         text = self._strip_bot_mention(text)
 
@@ -393,16 +471,22 @@ class SlackChannel(BaseChannel):
             and channel_type != "im"
         ):
             thread_ts = event_ts
-        # Add :eyes: reaction to the triggering message (best-effort)
-        try:
-            if self._web_client and event.get("ts"):
-                await self._web_client.reactions_add(
-                    channel=chat_id,
-                    name=self.config.react_emoji,
-                    timestamp=event.get("ts"),
-                )
-        except Exception as e:
-            self.logger.debug("reactions_add failed: {}", e)
+        # Show a processing indicator: an assistant typing status when
+        # configured, otherwise an :eyes: reaction on the triggering message.
+        if self.config.typing_status:
+            await self._set_typing_status(
+                chat_id, thread_ts or event_ts, self.config.typing_status
+            )
+        else:
+            try:
+                if self._web_client and event.get("ts"):
+                    await self._web_client.reactions_add(
+                        channel=chat_id,
+                        name=self.config.react_emoji,
+                        timestamp=event.get("ts"),
+                    )
+            except Exception as e:
+                self.logger.debug("reactions_add failed: {}", e)
 
         # Thread-scoped session key whenever the user is in a real thread
         # (raw_thread_ts is set). DM threads get their own session, separate
@@ -618,8 +702,11 @@ class SlackChannel(BaseChannel):
         return blocks
 
     async def _update_react_emoji(self, chat_id: str, ts: str | None) -> None:
-        """Remove the in-progress reaction and optionally add a done reaction."""
+        """Clear the processing indicator (typing status or reaction emoji)."""
         if not self._web_client or not ts:
+            return
+        if self.config.typing_status:
+            await self._set_typing_status(chat_id, ts, "")
             return
         try:
             await self._web_client.reactions_remove(
@@ -639,6 +726,19 @@ class SlackChannel(BaseChannel):
             except Exception as e:
                 self.logger.debug("done reaction failed: {}", e)
 
+    async def _set_typing_status(self, channel_id: str, thread_ts: str | None, status: str) -> None:
+        """Set or clear the assistant typing status indicator on a thread."""
+        if not self._web_client or not thread_ts:
+            return
+        try:
+            await self._web_client.assistant_threads_setStatus(
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                status=status,
+            )
+        except Exception as e:
+            self.logger.debug("assistant_threads_setStatus failed: {}", e)
+
     def _is_allowed(self, sender_id: str, chat_id: str, channel_type: str) -> bool:
         if channel_type == "im":
             if not self.config.dm.enabled:
@@ -657,15 +757,21 @@ class SlackChannel(BaseChannel):
             return True
         return self._bot_user_id is not None and f"<@{self._bot_user_id}>" in text
 
-    def _should_respond_in_channel(self, event_type: str, text: str, chat_id: str) -> bool:
+    def _should_respond_in_channel(
+        self, event_type: str, text: str, chat_id: str, thread_ts: str | None = None,
+    ) -> bool:
         if self.config.group_policy == "open":
             return True
         if self.config.group_policy == "mention":
+            if thread_ts and thread_ts in self._mention_threads:
+                return True
             return self._is_mention(event_type, text)
         if self.config.group_policy == "allowlist":
             if chat_id not in self.config.group_allow_from:
                 return False
             if self.config.group_require_mention:
+                if thread_ts and thread_ts in self._mention_threads:
+                    return True
                 return self._is_mention(event_type, text)
             return True
         return False
@@ -682,6 +788,16 @@ class SlackChannel(BaseChannel):
         if chat_id.startswith("G"):
             return "group"
         return "channel"
+
+    _MAX_MENTION_THREADS = 10_000
+
+    def _track_mention_thread(self, thread_key: str) -> None:
+        if thread_key in self._mention_threads:
+            self._mention_threads.move_to_end(thread_key)
+        else:
+            self._mention_threads[thread_key] = None
+            if len(self._mention_threads) > self._MAX_MENTION_THREADS:
+                self._mention_threads.popitem(last=False)
 
     def _strip_bot_mention(self, text: str) -> str:
         if not text or not self._bot_user_id:
