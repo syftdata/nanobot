@@ -304,10 +304,13 @@ class AgentRunner:
                     spec,
                     response.tool_calls,
                     external_lookup_counts,
+                    hook=hook,
+                    context=context,
                 )
                 tool_events.extend(new_events)
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
+                await hook.after_execute_tools(context)
                 completed_tool_results: list[dict[str, Any]] = []
                 for tool_call, result in zip(response.tool_calls, results):
                     tool_message = {
@@ -624,18 +627,45 @@ class AgentRunner:
         spec: AgentRunSpec,
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
+        hook: AgentHook | None = None,
+        context: AgentHookContext | None = None,
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+        """Run the requested tool calls, optionally invoking ``hook.before_run_tool``
+        and ``hook.after_run_tool`` around each one. Per-tool hooks let
+        streaming consumers emit a ``running`` step the instant each tool
+        begins and a ``completed``/``error`` step the instant it finishes,
+        rather than in a single burst at the end of the batch.
+        """
+        async def _run_one(
+            tool_call: ToolCallRequest,
+        ) -> tuple[Any, dict[str, str], BaseException | None]:
+            if hook is not None and context is not None:
+                try:
+                    await hook.before_run_tool(context, tool_call)
+                except Exception:
+                    logger.exception("before_run_tool hook raised for {}", tool_call.name)
+            try:
+                res = await self._run_tool(spec, tool_call, external_lookup_counts)
+            finally:
+                pass
+            if hook is not None and context is not None:
+                result_value, _event, error = res
+                try:
+                    await hook.after_run_tool(context, tool_call, result_value, error)
+                except Exception:
+                    logger.exception("after_run_tool hook raised for {}", tool_call.name)
+            return res
+
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
-                tool_results.extend(await asyncio.gather(*(
-                    self._run_tool(spec, tool_call, external_lookup_counts)
-                    for tool_call in batch
-                )))
+                tool_results.extend(
+                    await asyncio.gather(*(_run_one(tool_call) for tool_call in batch))
+                )
             else:
                 for tool_call in batch:
-                    tool_results.append(await self._run_tool(spec, tool_call, external_lookup_counts))
+                    tool_results.append(await _run_one(tool_call))
 
         results: list[Any] = []
         events: list[dict[str, str]] = []

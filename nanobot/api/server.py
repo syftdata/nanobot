@@ -97,6 +97,15 @@ def _sse_chunk(delta: str, model: str, chunk_id: str, finish_reason: str | None 
 
 _SSE_DONE = b"data: [DONE]\n\n"
 
+
+def _sse_tool_step(payload: dict[str, Any]) -> bytes:
+    """Format a ``tool_step`` SSE frame. The webapp's ``sse.ts`` translator
+    parses these frames into AI SDK tool-input/output UIMessage parts so the
+    chat UI can render intermediate tool-step cards alongside the text stream.
+    """
+    data = _json.dumps(payload, ensure_ascii=False, default=str)
+    return f"event: tool_step\ndata: {data}\n\n".encode()
+
 # ---------------------------------------------------------------------------
 # Upload helpers
 # ---------------------------------------------------------------------------
@@ -251,18 +260,40 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         resp.content_type = "text/event-stream"
         resp.headers["Cache-Control"] = "no-cache"
         resp.headers["Connection"] = "keep-alive"
-        resp.enable_compression()
+        # NOTE: do NOT enable compression on SSE — aiohttp's gzip encoder
+        # buffers writes until it accumulates enough bytes, which coalesces
+        # small ``tool_step`` frames into multi-second bursts and kills the
+        # progressive "one card per tool" rendering in the webapp.
+        # Also disable any intermediate proxy buffering (e.g. nginx) so
+        # downstream proxies forward each frame as soon as it is written.
+        resp.headers["X-Accel-Buffering"] = "no"
         await resp.prepare(request)
 
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        # Tagged items on the queue let us multiplex two SSE frame shapes over
+        # a single writer loop:
+        #   {"kind": "text", "text": str}          -> OpenAI-style delta.content
+        #   {"kind": "tool_step", "payload": dict} -> custom `event: tool_step`
+        #   None                                   -> sentinel; end the stream
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         stream_failed = False
 
         async def _on_stream(token: str) -> None:
-            await queue.put(token)
+            if token:
+                await queue.put({"kind": "text", "text": token})
 
-        async def _on_stream_end(*_a: Any, **_kw: Any) -> None:
+        async def _on_stream_end(*_a: Any, **kw: Any) -> None:
+            # The agent loop fires on_stream_end once per LLM call. When tools
+            # are about to run (``resuming=True``) the stream isn't actually
+            # over, so we must NOT close the queue — otherwise tool_step
+            # frames and follow-up text would be dropped. The ``finally``
+            # branch of ``_run`` handles the terminal close.
+            if kw.get("resuming"):
+                return
             await queue.put(None)
+
+        async def _on_tool_step(payload: dict[str, Any]) -> None:
+            await queue.put({"kind": "tool_step", "payload": payload})
 
         async def _run() -> None:
             nonlocal stream_failed
@@ -277,21 +308,29 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             chat_id=API_CHAT_ID,
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
+                            on_tool_step=_on_tool_step,
                         ),
                         timeout=timeout_s,
                     )
             except Exception:
                 stream_failed = True
                 logger.exception("Streaming error for session {}", session_key)
+            finally:
                 await queue.put(None)
 
         task = asyncio.create_task(_run())
         try:
             while True:
-                token = await queue.get()
-                if token is None:
+                item = await queue.get()
+                if item is None:
                     break
-                await resp.write(_sse_chunk(token, model_name, chunk_id))
+                kind = item.get("kind")
+                if kind == "text":
+                    text_delta = item.get("text") or ""
+                    if text_delta:
+                        await resp.write(_sse_chunk(text_delta, model_name, chunk_id))
+                elif kind == "tool_step":
+                    await resp.write(_sse_tool_step(item.get("payload") or {}))
         finally:
             task.cancel()
 
@@ -300,7 +339,13 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             await resp.write(_SSE_DONE)
         return resp
 
-    # -- non-streaming path (original logic) --
+    # -- non-streaming path --
+    # When the agent uses MessageTool on the ``api`` channel, _process_message
+    # now surfaces the tool's content as the OutboundMessage return value
+    # (see agent/loop.py post-loop MessageTool block) so we no longer need the
+    # blind retry that was previously required to work around empty returns.
+    # We still keep a terminal fallback for the (rare) case where neither the
+    # LLM's direct text nor MessageTool produced any content.
     _FALLBACK = EMPTY_FINAL_RESPONSE_MESSAGE
 
     try:
@@ -319,20 +364,22 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                 response_text = _response_text(response)
 
                 if not response_text or not response_text.strip():
-                    logger.warning("Empty response for session {}, retrying", session_key)
-                    retry_response = await asyncio.wait_for(
-                        agent_loop.process_direct(
-                            content=text,
-                            media=media_paths if media_paths else None,
-                            session_key=session_key,
-                            channel="api",
-                            chat_id=API_CHAT_ID,
-                        ),
-                        timeout=timeout_s,
-                    )
-                    response_text = _response_text(retry_response)
-                    if not response_text or not response_text.strip():
-                        logger.warning("Empty response after retry, using fallback")
+                    # Last-resort: if MessageTool fired during the turn but the
+                    # OutboundMessage path didn't carry the content for some
+                    # reason, read it directly from the tool before falling back.
+                    mt = None
+                    try:
+                        mt = agent_loop.tools.get("message")
+                    except Exception:
+                        mt = None
+                    mt_content = getattr(mt, "last_sent_content", None) if mt else None
+                    if mt_content and mt_content.strip():
+                        response_text = mt_content
+                    else:
+                        logger.warning(
+                            "Empty response for session {}, using fallback",
+                            session_key,
+                        )
                         response_text = _FALLBACK
 
             except asyncio.TimeoutError:

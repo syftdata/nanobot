@@ -11,6 +11,7 @@ import pytest_asyncio
 
 from nanobot.api.server import (
     _sse_chunk,
+    _sse_tool_step,
     _SSE_DONE,
     create_app,
 )
@@ -51,6 +52,24 @@ def test_sse_chunk_finish_reason() -> None:
 
 def test_sse_done_format() -> None:
     assert _SSE_DONE == b"data: [DONE]\n\n"
+
+
+def test_sse_tool_step_frame_shape() -> None:
+    """A tool_step payload should be serialised as a named-event SSE frame
+    matching the format `sse.ts` parses (``event:`` line + ``data:`` JSON)."""
+    payload = {
+        "id": "ts_1",
+        "tool": "search",
+        "status": "completed",
+        "input": {"q": "leads"},
+        "output": {"rows": 3},
+    }
+    raw = _sse_tool_step(payload).decode()
+    assert raw.startswith("event: tool_step\n")
+    assert raw.endswith("\n\n")
+    data_line = [l for l in raw.split("\n") if l.startswith("data: ")][0]
+    parsed = json.loads(data_line[len("data: "):])
+    assert parsed == payload
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +270,233 @@ async def test_stream_with_session_id(aiohttp_client) -> None:
     )
     assert resp.status == 200
     assert captured_key == "api:my-session"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_stream_forwards_on_tool_step_frames(aiohttp_client) -> None:
+    """When the agent loop fires ``on_tool_step``, the streaming endpoint
+    should serialise the payload as an ``event: tool_step`` SSE frame so the
+    webapp's sse.ts translator can render tool-step cards inline with text."""
+
+    async def fake_process_direct(**kwargs):
+        on_stream = kwargs.get("on_stream")
+        on_tool_step = kwargs.get("on_tool_step")
+        on_stream_end = kwargs.get("on_stream_end")
+        if on_stream:
+            await on_stream("Checking leads")
+        if on_tool_step:
+            await on_tool_step({
+                "id": "ts_1",
+                "tool": "search_leads",
+                "status": "completed",
+                "input": {"q": "top"},
+                "output": {"count": 5},
+            })
+        if on_stream:
+            await on_stream(" — done.")
+        if on_stream_end:
+            await on_stream_end(resuming=False)
+        return "Checking leads — done."
+
+    agent = MagicMock()
+    agent.process_direct = fake_process_direct
+    agent._connect_mcp = AsyncMock()
+    agent.close_mcp = AsyncMock()
+
+    app = create_app(agent, model_name="m")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "leads?"}], "stream": True},
+    )
+    assert resp.status == 200
+    body = await resp.text()
+
+    assert "event: tool_step" in body, body
+    # Extract the tool_step data line and verify it's valid JSON with the
+    # expected fields.
+    ts_frame = [
+        block for block in body.split("\n\n") if block.startswith("event: tool_step")
+    ][0]
+    data_line = [l for l in ts_frame.split("\n") if l.startswith("data: ")][0]
+    parsed = json.loads(data_line[len("data: "):])
+    assert parsed["id"] == "ts_1"
+    assert parsed["tool"] == "search_leads"
+    assert parsed["status"] == "completed"
+
+    # Text deltas before and after the tool step should still appear as
+    # standard OpenAI-style chunks.
+    text_lines = [
+        l[len("data: "):]
+        for l in body.split("\n")
+        if l.startswith("data: ") and l != "data: [DONE]"
+    ]
+    text_chunks = [json.loads(l) for l in text_lines if '"delta"' in l]
+    content_deltas = [
+        c["choices"][0]["delta"].get("content", "")
+        for c in text_chunks
+        if c["choices"][0]["delta"].get("content")
+    ]
+    assert "Checking leads" in "".join(content_deltas)
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_stream_message_tool_content_surfaces_as_text(aiohttp_client) -> None:
+    """When the agent uses MessageTool (its content=... becomes the user-
+    facing reply), the streaming endpoint should surface it via ``on_stream``
+    — the webapp has no other way to receive MessageTool output on the api
+    channel because no bus subscriber listens there."""
+
+    async def fake_process_direct(**kwargs):
+        # Simulate what _LoopHook.after_execute_tools does for MessageTool on
+        # the api channel: the tool's content argument is streamed as text.
+        on_stream = kwargs.get("on_stream")
+        on_stream_end = kwargs.get("on_stream_end")
+        if on_stream:
+            await on_stream("Here are your top leads: Alice, Bob, Carol.")
+        if on_stream_end:
+            await on_stream_end(resuming=False)
+        return None  # process_direct returns None when streamed content was already emitted
+
+    agent = MagicMock()
+    agent.process_direct = fake_process_direct
+    agent._connect_mcp = AsyncMock()
+    agent.close_mcp = AsyncMock()
+
+    app = create_app(agent, model_name="m")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "leads"}], "stream": True},
+    )
+    assert resp.status == 200
+    body = await resp.text()
+
+    # A text-delta frame with the MessageTool content should appear.
+    text_lines = [
+        l[len("data: "):]
+        for l in body.split("\n")
+        if l.startswith("data: ") and l != "data: [DONE]"
+    ]
+    chunks = [json.loads(l) for l in text_lines]
+    combined = "".join(
+        c["choices"][0]["delta"].get("content", "") or ""
+        for c in chunks
+    )
+    assert "Here are your top leads" in combined
+    assert "[DONE]" in body
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_stream_resuming_stream_end_does_not_close_response(aiohttp_client) -> None:
+    """The agent loop fires on_stream_end(resuming=True) between tool-calling
+    iterations. The streaming endpoint must keep the SSE stream open until
+    the final ``resuming=False`` (or process_direct returns)."""
+
+    async def fake_process_direct(**kwargs):
+        on_stream = kwargs.get("on_stream")
+        on_stream_end = kwargs.get("on_stream_end")
+        if on_stream:
+            await on_stream("Thinking...")
+        if on_stream_end:
+            await on_stream_end(resuming=True)  # tool call about to run — do NOT close
+        if on_stream:
+            await on_stream(" done.")
+        if on_stream_end:
+            await on_stream_end(resuming=False)  # actual terminal end
+        return "Thinking... done."
+
+    agent = MagicMock()
+    agent.process_direct = fake_process_direct
+    agent._connect_mcp = AsyncMock()
+    agent.close_mcp = AsyncMock()
+
+    app = create_app(agent, model_name="m")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "go"}], "stream": True},
+    )
+    assert resp.status == 200
+    body = await resp.text()
+    # Both deltas should be present; the resuming=True end must not have
+    # truncated the stream.
+    text_lines = [
+        l[len("data: "):]
+        for l in body.split("\n")
+        if l.startswith("data: ") and l != "data: [DONE]"
+    ]
+    chunks = [json.loads(l) for l in text_lines]
+    combined = "".join(
+        c["choices"][0]["delta"].get("content", "") or ""
+        for c in chunks
+    )
+    assert "Thinking..." in combined
+    assert " done." in combined
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_nonstream_uses_message_tool_last_sent_content(aiohttp_client) -> None:
+    """Non-streaming path: if process_direct returns empty but MessageTool
+    fired during the turn, the endpoint should surface ``mt.last_sent_content``
+    as the response text instead of falling back to the placeholder."""
+    agent = MagicMock()
+    agent.process_direct = AsyncMock(return_value=None)
+    agent._connect_mcp = AsyncMock()
+    agent.close_mcp = AsyncMock()
+
+    mt = MagicMock()
+    mt.last_sent_content = "hi from MessageTool"
+    agent.tools = MagicMock()
+    agent.tools.get = MagicMock(return_value=mt)
+
+    app = create_app(agent, model_name="m")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "leads"}], "stream": False},
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["choices"][0]["message"]["content"] == "hi from MessageTool"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_nonstream_falls_back_when_no_message_tool_content(aiohttp_client) -> None:
+    """When neither the LLM nor MessageTool produced any content, the non-
+    streaming path should still return the placeholder message as a last
+    resort (not throw)."""
+    from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+
+    agent = MagicMock()
+    agent.process_direct = AsyncMock(return_value=None)
+    agent._connect_mcp = AsyncMock()
+    agent.close_mcp = AsyncMock()
+
+    mt = MagicMock()
+    mt.last_sent_content = None
+    agent.tools = MagicMock()
+    agent.tools.get = MagicMock(return_value=mt)
+
+    app = create_app(agent, model_name="m")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": False},
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["choices"][0]["message"]["content"] == EMPTY_FINAL_RESPONSE_MESSAGE
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")

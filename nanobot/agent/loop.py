@@ -34,7 +34,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import LLMProvider, ToolCallRequest
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
@@ -58,6 +58,7 @@ class _LoopHook(AgentHook):
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         *,
         channel: str = "cli",
         chat_id: str = "direct",
@@ -68,6 +69,7 @@ class _LoopHook(AgentHook):
         self._on_progress = on_progress
         self._on_stream = on_stream
         self._on_stream_end = on_stream_end
+        self._on_tool_step = on_tool_step
         self._channel = channel
         self._chat_id = chat_id
         self._message_id = message_id
@@ -108,6 +110,100 @@ class _LoopHook(AgentHook):
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
         self._loop._set_tool_context(self._channel, self._chat_id, self._message_id)
+
+    async def before_run_tool(
+        self, context: AgentHookContext, tool_call: ToolCallRequest
+    ) -> None:
+        """Emit a ``tool_step`` ``running`` frame the moment this tool starts.
+
+        We fire per-tool (rather than once per batch in
+        ``before_execute_tools``) so streaming clients can render the "tool
+        is working" card immediately, even while earlier tools in the same
+        batch are still executing concurrently. The ``message`` tool is
+        handled via ``on_stream`` in ``after_run_tool`` instead — it surfaces
+        to the user as normal assistant text rather than a tool card.
+        """
+        if self._channel != "api":
+            return
+        if self._on_tool_step is None or tool_call.name == "message":
+            return
+        payload: dict[str, Any] = {
+            "id": tool_call.id or f"ts-{tool_call.name}-{id(tool_call)}",
+            "tool": tool_call.name,
+            "status": "running",
+            "input": tool_call.arguments if isinstance(tool_call.arguments, dict) else {},
+        }
+        try:
+            await self._on_tool_step(payload)
+        except Exception:
+            logger.exception("on_tool_step error (running)")
+
+    async def after_run_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        result: Any,
+        error: BaseException | None,
+    ) -> None:
+        """Emit a ``tool_step`` ``completed``/``error`` frame the moment this
+        tool finishes, or stream ``message`` tool content as assistant text.
+
+        Gated on the "api" channel so we don't double-deliver into
+        slack/feishu (those channels receive ``message`` output via their own
+        bus handler).
+        """
+        if self._channel != "api":
+            return
+        from nanobot.utils.helpers import strip_think
+
+        if tool_call.name == "message":
+            if self._on_stream is None:
+                return
+            raw_content = ""
+            if isinstance(tool_call.arguments, dict):
+                raw_content = tool_call.arguments.get("content") or ""
+            if not isinstance(raw_content, str):
+                return
+            cleaned = strip_think(raw_content).strip()
+            if cleaned:
+                try:
+                    await self._on_stream(cleaned)
+                except Exception:
+                    logger.exception("on_stream error streaming MessageTool content")
+            return
+
+        if self._on_tool_step is None:
+            return
+        payload: dict[str, Any] = {
+            "id": tool_call.id or f"ts-{tool_call.name}-{id(tool_call)}",
+            "tool": tool_call.name,
+            "status": "error" if error is not None else "completed",
+            "input": tool_call.arguments if isinstance(tool_call.arguments, dict) else {},
+            "output": self._summarize_tool_result(result),
+        }
+        if error is not None:
+            payload["error"] = f"{type(error).__name__}: {error}"[:500]
+        try:
+            await self._on_tool_step(payload)
+        except Exception:
+            logger.exception("on_tool_step error (terminal)")
+
+    @staticmethod
+    def _summarize_tool_result(result: Any) -> Any:
+        """Coerce a tool result into something JSON-serialisable for the
+        ``tool_step`` SSE payload. Mirrors what the fake nanobot emits: either a
+        primitive string or a small dict describing the result."""
+        if result is None:
+            return None
+        if isinstance(result, (str, int, float, bool)):
+            return result
+        if isinstance(result, (list, dict)):
+            try:
+                json.dumps(result)
+                return result
+            except (TypeError, ValueError):
+                return str(result)[:2000]
+        return str(result)[:2000]
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         u = context.usage or {}
@@ -388,6 +484,7 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         *,
         session: Session | None = None,
         channel: str = "cli",
@@ -409,6 +506,7 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            on_tool_step=on_tool_step,
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
@@ -697,6 +795,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
@@ -844,6 +943,7 @@ class AgentLoop:
             on_stream=on_stream,
             on_stream_end=on_stream_end,
             on_retry_wait=_on_retry_wait,
+            on_tool_step=on_tool_step,
             session=session,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -870,6 +970,20 @@ class AgentLoop:
         # came from MessageTool.
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             if not had_injections or stop_reason == "empty_final_response":
+                # For the webapp API channel there is no bus subscriber for
+                # OutboundMessage(channel="api"), so if MessageTool delivered
+                # the real reply we must surface it as the process_direct
+                # return value — otherwise the non-streaming path returns
+                # nothing. Streaming callers already got the content through
+                # the after_execute_tools bridge, so they still return None.
+                if msg.channel == "api" and on_stream is None and mt.last_sent_content:
+                    meta = dict(msg.metadata or {})
+                    return OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=mt.last_sent_content,
+                        metadata=meta,
+                    )
                 return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
@@ -1105,6 +1219,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
@@ -1118,4 +1233,5 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            on_tool_step=on_tool_step,
         )

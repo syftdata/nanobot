@@ -38,6 +38,7 @@ class MessageTool(Tool):
             default=default_message_id,
         )
         self._sent_in_turn_var: ContextVar[bool] = ContextVar("message_sent_in_turn", default=False)
+        self._last_sent_content_var: ContextVar[str | None] = ContextVar("message_last_sent_content", default=None)
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
@@ -52,6 +53,7 @@ class MessageTool(Tool):
     def start_turn(self) -> None:
         """Reset per-turn send tracking."""
         self._sent_in_turn = False
+        self.last_sent_content = None
 
     @property
     def _sent_in_turn(self) -> bool:
@@ -60,6 +62,14 @@ class MessageTool(Tool):
     @_sent_in_turn.setter
     def _sent_in_turn(self, value: bool) -> None:
         self._sent_in_turn_var.set(value)
+
+    @property
+    def last_sent_content(self) -> str | None:
+        return self._last_sent_content_var.get()
+
+    @last_sent_content.setter
+    def last_sent_content(self, value: str | None) -> None:
+        self._last_sent_content_var.set(value)
 
     @property
     def name(self) -> str:
@@ -121,6 +131,7 @@ class MessageTool(Tool):
             await self._send_callback(msg)
             if channel == default_channel and chat_id == default_chat_id:
                 self._sent_in_turn = True
+                self.last_sent_content = content
             media_info = f" with {len(media)} attachments" if media else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:

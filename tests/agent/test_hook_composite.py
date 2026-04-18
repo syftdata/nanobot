@@ -116,13 +116,16 @@ async def test_composite_error_isolation_on_stream():
 
 @pytest.mark.asyncio
 async def test_composite_error_isolation_all_async():
-    """Error isolation for on_stream_end, before_execute_tools, after_iteration."""
+    """Error isolation for on_stream_end, before_execute_tools,
+    after_execute_tools, after_iteration."""
     calls: list[str] = []
 
     class Bad(AgentHook):
         async def on_stream_end(self, context, *, resuming):
             raise RuntimeError("err")
         async def before_execute_tools(self, context):
+            raise RuntimeError("err")
+        async def after_execute_tools(self, context):
             raise RuntimeError("err")
         async def after_iteration(self, context):
             raise RuntimeError("err")
@@ -132,6 +135,8 @@ async def test_composite_error_isolation_all_async():
             calls.append("on_stream_end")
         async def before_execute_tools(self, context):
             calls.append("before_execute_tools")
+        async def after_execute_tools(self, context):
+            calls.append("after_execute_tools")
         async def after_iteration(self, context):
             calls.append("after_iteration")
 
@@ -139,8 +144,32 @@ async def test_composite_error_isolation_all_async():
     ctx = _ctx()
     await hook.on_stream_end(ctx, resuming=False)
     await hook.before_execute_tools(ctx)
+    await hook.after_execute_tools(ctx)
     await hook.after_iteration(ctx)
-    assert calls == ["on_stream_end", "before_execute_tools", "after_iteration"]
+    assert calls == [
+        "on_stream_end",
+        "before_execute_tools",
+        "after_execute_tools",
+        "after_iteration",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_composite_fans_out_after_execute_tools():
+    """after_execute_tools must fan out to every wrapped hook in order."""
+    events: list[str] = []
+
+    class RecordingA(AgentHook):
+        async def after_execute_tools(self, context: AgentHookContext) -> None:
+            events.append("A")
+
+    class RecordingB(AgentHook):
+        async def after_execute_tools(self, context: AgentHookContext) -> None:
+            events.append("B")
+
+    hook = CompositeHook([RecordingA(), RecordingB()])
+    await hook.after_execute_tools(_ctx())
+    assert events == ["A", "B"]
 
 
 # ---------------------------------------------------------------------------
