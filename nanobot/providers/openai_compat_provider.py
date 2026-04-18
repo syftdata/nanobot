@@ -178,6 +178,32 @@ def _coerce_dict(value: Any) -> dict[str, Any] | None:
     return None
 
 
+def _coerce_tool_call_args(raw: Any) -> Any:
+    """Normalize tool-call arguments, treating empty non-object payloads as no-args.
+
+    Builds on :func:`parse_tool_arguments` (which preserves malformed JSON so
+    ToolRegistry can reject it) but additionally maps the Gemini "no arguments"
+    encodings to an empty dict:
+
+      - OpenAI / Anthropic: ``"{}"``
+      - Gemini (via its OpenAI-compatible endpoint): ``"[]"`` or ``""``
+      - Some older proxies: ``null`` or a bare dict already
+
+    ``"[]"`` decodes to a Python list, which downstream tool validation rejects
+    with ``"parameters must be an object, got list"`` — forcing the agent
+    through a wasted retry round-trip. We treat an *empty* non-dict payload as
+    the empty-args case so tools with only-optional parameters execute on the
+    first try, while still preserving non-empty malformed payloads so the
+    registry can reject genuinely bad arguments.
+    """
+    parsed = parse_tool_arguments(raw)
+    if isinstance(parsed, dict):
+        return parsed
+    if not parsed:
+        return {}
+    return parsed
+
+
 def _extract_tc_extras(tc: Any) -> tuple[
     dict[str, Any] | None,
     dict[str, Any] | None,
@@ -1037,12 +1063,11 @@ class OpenAICompatProvider(LLMProvider):
             for tc in raw_tool_calls:
                 tc_map = self._maybe_mapping(tc) or {}
                 fn = self._maybe_mapping(tc_map.get("function")) or {}
-                args = parse_tool_arguments(fn.get("arguments", {}))
                 ec, prov, fn_prov = _extract_tc_extras(tc)
                 parsed_tool_calls.append(ToolCallRequest(
                     id=str(tc_map.get("id") or _short_tool_id()),
                     name=str(fn.get("name") or ""),
-                    arguments=args,
+                    arguments=_coerce_tool_call_args(fn.get("arguments", {})),
                     extra_content=ec,
                     provider_specific_fields=prov,
                     function_provider_specific_fields=fn_prov,
@@ -1078,12 +1103,11 @@ class OpenAICompatProvider(LLMProvider):
 
         tool_calls = []
         for tc in raw_tool_calls:
-            args = parse_tool_arguments(tc.function.arguments)
             ec, prov, fn_prov = _extract_tc_extras(tc)
             tool_calls.append(ToolCallRequest(
                 id=str(getattr(tc, "id", None) or _short_tool_id()),
                 name=tc.function.name,
-                arguments=args,
+                arguments=_coerce_tool_call_args(tc.function.arguments),
                 extra_content=ec,
                 provider_specific_fields=prov,
                 function_provider_specific_fields=fn_prov,
@@ -1219,7 +1243,7 @@ class OpenAICompatProvider(LLMProvider):
                 ToolCallRequest(
                     id=b["id"] or _short_tool_id(),
                     name=b["name"],
-                    arguments=parse_tool_arguments(b["arguments"]),
+                    arguments=_coerce_tool_call_args(b["arguments"]),
                     extra_content=b.get("extra_content"),
                     provider_specific_fields=b.get("prov"),
                     function_provider_specific_fields=b.get("fn_prov"),
