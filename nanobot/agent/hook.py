@@ -88,6 +88,44 @@ class AgentHook:
         """
         pass
 
+    async def before_run_tool(
+        self, context: AgentHookContext, tool_call: ToolCallRequest
+    ) -> None:
+        """Called immediately before each individual tool is executed.
+
+        Unlike ``before_execute_tools`` (which fires once per iteration for the
+        whole batch), this fires per-tool so streaming clients can surface a
+        "running" indicator at the moment each tool starts. When tools in a
+        batch run concurrently, multiple ``before_run_tool`` calls may overlap
+        with ``after_run_tool`` for other tools in the same batch.
+        """
+        pass
+
+    async def after_run_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        result: Any,
+        error: BaseException | None,
+    ) -> None:
+        """Called immediately after each individual tool finishes executing.
+
+        ``result`` is whatever the tool returned (or the error-shaped string
+        the runner fabricates when ``fail_on_tool_error`` is false). ``error``
+        is non-None only when the runner considers this a fatal error. Pair
+        with ``before_run_tool`` to emit a completed/errored step to clients.
+        """
+        pass
+
+    async def after_execute_tools(self, context: AgentHookContext) -> None:
+        """Called immediately after the batch of tool calls for one iteration
+        has finished executing, with ``context.tool_results`` populated. Hooks
+        can inspect tool call/result pairs here to surface intermediate steps
+        to a client (e.g. stream MessageTool content as text deltas, or emit
+        ``tool_step`` SSE events for other tools).
+        """
+        pass
+
     async def after_iteration(self, context: AgentHookContext) -> None:
         pass
 
@@ -152,6 +190,25 @@ class CompositeHook(AgentHook):
 
     async def emit_reasoning_end(self) -> None:
         await self._for_each_hook_safe("emit_reasoning_end")
+
+    async def before_run_tool(
+        self, context: AgentHookContext, tool_call: ToolCallRequest
+    ) -> None:
+        await self._for_each_hook_safe("before_run_tool", context, tool_call)
+
+    async def after_run_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        result: Any,
+        error: BaseException | None,
+    ) -> None:
+        await self._for_each_hook_safe(
+            "after_run_tool", context, tool_call, result, error
+        )
+
+    async def after_execute_tools(self, context: AgentHookContext) -> None:
+        await self._for_each_hook_safe("after_execute_tools", context)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         await self._for_each_hook_safe("after_iteration", context)

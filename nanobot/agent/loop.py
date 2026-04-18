@@ -124,6 +124,7 @@ class TurnContext:
     on_stream: Callable[[str], Awaitable[None]] | None = None
     on_stream_end: Callable[..., Awaitable[None]] | None = None
     on_retry_wait: Callable[[str], Awaitable[None]] | None = None
+    on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
     pending_queue: asyncio.Queue | None = None
     pending_summary: str | None = None
@@ -685,6 +686,7 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         *,
         session: Session | None = None,
         channel: str = "cli",
@@ -711,6 +713,7 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            on_tool_step=on_tool_step,
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
@@ -1136,6 +1139,7 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
     ) -> OutboundMessage | None:
         """Process a system inbound message (e.g. subagent announce)."""
@@ -1234,6 +1238,7 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
         ephemeral: bool = False,
         tools: ToolRegistry | None = None,
@@ -1266,6 +1271,7 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            on_tool_step=on_tool_step,
             pending_queue=pending_queue,
             ephemeral=ephemeral,
             tools=tools,
@@ -1340,6 +1346,20 @@ class AgentLoop:
         # MessageTool suppression
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             if not had_injections or stop_reason == "empty_final_response":
+                # For the webapp API channel there is no bus subscriber for
+                # OutboundMessage(channel="api"), so if MessageTool delivered
+                # the real reply we must surface it as the process_direct
+                # return value — otherwise the non-streaming path returns
+                # nothing. Streaming callers already got the content through
+                # the after_execute_tools bridge, so they still return None.
+                if msg.channel == "api" and on_stream is None and mt.last_sent_content:
+                    meta = dict(msg.metadata or {})
+                    return OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=mt.last_sent_content,
+                        metadata=meta,
+                    )
                 return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
@@ -1485,6 +1505,7 @@ class AgentLoop:
             on_stream=ctx.on_stream,
             on_stream_end=ctx.on_stream_end,
             on_retry_wait=ctx.on_retry_wait,
+            on_tool_step=ctx.on_tool_step,
             session=ctx.session,
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
@@ -1808,6 +1829,7 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         ephemeral: bool = False,
         tools: ToolRegistry | None = None,
+        on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
@@ -1825,6 +1847,7 @@ class AgentLoop:
                     "on_stream": on_stream,
                     "on_stream_end": on_stream_end,
                     "ephemeral": ephemeral,
+                    "on_tool_step": on_tool_step,
                 }
                 if tools is not None:
                     kwargs["tools"] = tools

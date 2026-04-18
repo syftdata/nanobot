@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.providers.base import ToolCallRequest
 from nanobot.utils.helpers import IncrementalThinkExtractor, strip_think
 from nanobot.utils.progress_events import (
     build_tool_event_finish_payloads,
@@ -27,6 +28,7 @@ class AgentProgressHook(AgentHook):
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         *,
         channel: str = "cli",
         chat_id: str = "direct",
@@ -41,6 +43,7 @@ class AgentProgressHook(AgentHook):
         self._on_progress = on_progress
         self._on_stream = on_stream
         self._on_stream_end = on_stream_end
+        self._on_tool_step = on_tool_step
         self._channel = channel
         self._chat_id = chat_id
         self._message_id = message_id
@@ -150,6 +153,98 @@ class AgentProgressHook(AgentHook):
             await self._on_progress("", reasoning_end=True)
         else:
             self._reasoning_open = False
+
+    async def before_run_tool(
+        self, context: AgentHookContext, tool_call: ToolCallRequest
+    ) -> None:
+        """Emit a ``tool_step`` ``running`` frame the moment this tool starts.
+
+        We fire per-tool (rather than once per batch in
+        ``before_execute_tools``) so streaming clients can render the "tool
+        is working" card immediately, even while earlier tools in the same
+        batch are still executing concurrently. The ``message`` tool is
+        handled via ``on_stream`` in ``after_run_tool`` instead — it surfaces
+        to the user as normal assistant text rather than a tool card.
+        """
+        if self._channel != "api":
+            return
+        if self._on_tool_step is None or tool_call.name == "message":
+            return
+        payload: dict[str, Any] = {
+            "id": tool_call.id or f"ts-{tool_call.name}-{id(tool_call)}",
+            "tool": tool_call.name,
+            "status": "running",
+            "input": tool_call.arguments if isinstance(tool_call.arguments, dict) else {},
+        }
+        try:
+            await self._on_tool_step(payload)
+        except Exception:
+            logger.exception("on_tool_step error (running)")
+
+    async def after_run_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        result: Any,
+        error: BaseException | None,
+    ) -> None:
+        """Emit a ``tool_step`` ``completed``/``error`` frame the moment this
+        tool finishes, or stream ``message`` tool content as assistant text.
+
+        Gated on the "api" channel so we don't double-deliver into
+        slack/feishu (those channels receive ``message`` output via their own
+        bus handler).
+        """
+        if self._channel != "api":
+            return
+
+        if tool_call.name == "message":
+            if self._on_stream is None:
+                return
+            raw_content = ""
+            if isinstance(tool_call.arguments, dict):
+                raw_content = tool_call.arguments.get("content") or ""
+            if not isinstance(raw_content, str):
+                return
+            cleaned = (strip_think(raw_content) or "").strip()
+            if cleaned:
+                try:
+                    await self._on_stream(cleaned)
+                except Exception:
+                    logger.exception("on_stream error streaming MessageTool content")
+            return
+
+        if self._on_tool_step is None:
+            return
+        payload: dict[str, Any] = {
+            "id": tool_call.id or f"ts-{tool_call.name}-{id(tool_call)}",
+            "tool": tool_call.name,
+            "status": "error" if error is not None else "completed",
+            "input": tool_call.arguments if isinstance(tool_call.arguments, dict) else {},
+            "output": self._summarize_tool_result(result),
+        }
+        if error is not None:
+            payload["error"] = f"{type(error).__name__}: {error}"[:500]
+        try:
+            await self._on_tool_step(payload)
+        except Exception:
+            logger.exception("on_tool_step error (terminal)")
+
+    @staticmethod
+    def _summarize_tool_result(result: Any) -> Any:
+        """Coerce a tool result into something JSON-serialisable for the
+        ``tool_step`` SSE payload: either a primitive/string or a small dict."""
+        if result is None:
+            return None
+        if isinstance(result, (str, int, float, bool)):
+            return result
+        if isinstance(result, (list, dict)):
+            try:
+                json.dumps(result)
+                return result
+            except (TypeError, ValueError):
+                return str(result)[:2000]
+        return str(result)[:2000]
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         if (

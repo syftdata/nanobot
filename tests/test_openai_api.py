@@ -350,20 +350,21 @@ async def test_multimodal_remote_image_url_returns_400(aiohttp_client, mock_agen
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
-async def test_empty_response_retry_then_success(aiohttp_client) -> None:
+async def test_empty_response_uses_message_tool_content(aiohttp_client) -> None:
+    """When the LLM returns no direct text but MessageTool emitted content
+    during the turn, the API surfaces that content instead of retrying."""
     call_count = 0
 
-    async def sometimes_empty(content, session_key="", channel="", chat_id="", **kwargs):
+    async def always_empty(content, session_key="", channel="", chat_id="", **kwargs):
         nonlocal call_count
         call_count += 1
-        if call_count == 1:
-            return ""
-        return "recovered response"
+        return ""
 
     agent = MagicMock()
-    agent.process_direct = sometimes_empty
+    agent.process_direct = always_empty
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
+    agent.tools = {"message": MagicMock(last_sent_content="recovered response")}
 
     app = create_app(agent, model_name="m")
     client = await aiohttp_client(app)
@@ -374,7 +375,7 @@ async def test_empty_response_retry_then_success(aiohttp_client) -> None:
     assert resp.status == 200
     body = await resp.json()
     assert body["choices"][0]["message"]["content"] == "recovered response"
-    assert call_count == 2
+    assert call_count == 1
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
@@ -393,6 +394,7 @@ async def test_empty_response_falls_back(aiohttp_client) -> None:
     agent.process_direct = always_empty
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
+    agent.tools = {}
 
     app = create_app(agent, model_name="m")
     client = await aiohttp_client(app)
@@ -403,7 +405,7 @@ async def test_empty_response_falls_back(aiohttp_client) -> None:
     assert resp.status == 200
     body = await resp.json()
     assert body["choices"][0]["message"]["content"] == EMPTY_FINAL_RESPONSE_MESSAGE
-    assert call_count == 2
+    assert call_count == 1
 
 
 @pytest.mark.asyncio
@@ -417,7 +419,17 @@ async def test_process_direct_accepts_media() -> None:
 
     captured_msg = None
 
-    async def fake_process(msg, *, session_key="", on_progress=None, on_stream=None, on_stream_end=None, ephemeral=False):
+    async def fake_process(
+        msg,
+        *,
+        session_key="",
+        on_progress=None,
+        on_stream=None,
+        on_stream_end=None,
+        ephemeral=False,
+        tools=None,
+        on_tool_step=None,
+    ):
         nonlocal captured_msg
         captured_msg = msg
         return None

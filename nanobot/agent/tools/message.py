@@ -89,6 +89,10 @@ class MessageTool(Tool, ContextAware):
             "message_suppress_delivery",
             default=False,
         )
+        self._last_sent_content_var: ContextVar[str | None] = ContextVar(
+            "message_last_sent_content",
+            default=None,
+        )
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
@@ -114,6 +118,7 @@ class MessageTool(Tool, ContextAware):
         """Reset per-turn send tracking."""
         self._sent_in_turn = False
         self._turn_delivered_media_var.set(())
+        self.last_sent_content = None
 
     def turn_delivered_media_paths(self) -> list[str]:
         """Absolute paths attached via this tool to the active chat in the current turn."""
@@ -142,6 +147,14 @@ class MessageTool(Tool, ContextAware):
     @_sent_in_turn.setter
     def _sent_in_turn(self, value: bool) -> None:
         self._sent_in_turn_var.set(value)
+
+    @property
+    def last_sent_content(self) -> str | None:
+        return self._last_sent_content_var.get()
+
+    @last_sent_content.setter
+    def last_sent_content(self, value: str | None) -> None:
+        self._last_sent_content_var.set(value)
 
     @property
     def name(self) -> str:
@@ -266,6 +279,7 @@ class MessageTool(Tool, ContextAware):
                 if media:
                     prev = self._turn_delivered_media_var.get()
                     self._turn_delivered_media_var.set(prev + tuple(str(p) for p in media))
+                self.last_sent_content = content
             media_info = f" with {len(media)} attachments" if media else ""
             button_info = f" with {sum(len(row) for row in buttons)} button(s)" if buttons else ""
             return f"Message sent to {channel}:{chat_id}{media_info}{button_info}"
