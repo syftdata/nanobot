@@ -41,6 +41,7 @@ class ChannelsConfig(Base):
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
     transcription_provider: str = "groq"  # Deprecated: use top-level transcription.provider
     transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Deprecated: use top-level transcription.language
+    tool_hint_labels: dict[str, str] = Field(default_factory=dict)  # tool_name -> user-facing phrase (e.g. "Querying your data")
 
 
 class TranscriptionConfig(Base):

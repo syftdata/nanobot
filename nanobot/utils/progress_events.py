@@ -33,11 +33,14 @@ async def invoke_on_progress(
     *,
     tool_hint: bool = False,
     tool_events: list[dict[str, Any]] | None = None,
+    humanized_hint: str | None = None,
 ) -> None:
+    kwargs: dict[str, Any] = {"tool_hint": tool_hint}
     if tool_events and on_progress_accepts_tool_events(on_progress):
-        await on_progress(content, tool_hint=tool_hint, tool_events=tool_events)
-        return
-    await on_progress(content, tool_hint=tool_hint)
+        kwargs["tool_events"] = tool_events
+    if humanized_hint is not None and _on_progress_accepts(on_progress, "humanized_hint"):
+        kwargs["humanized_hint"] = humanized_hint
+    await on_progress(content, **kwargs)
 
 
 async def invoke_file_edit_progress(

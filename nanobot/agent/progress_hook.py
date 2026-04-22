@@ -17,7 +17,7 @@ from nanobot.utils.progress_events import (
     invoke_on_progress,
     on_progress_accepts_tool_events,
 )
-from nanobot.utils.tool_hints import format_tool_hints
+from nanobot.utils.tool_hints import format_tool_hints, humanize_tool_hints
 
 
 class AgentProgressHook(AgentHook):
@@ -36,6 +36,7 @@ class AgentProgressHook(AgentHook):
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         tool_hint_max_length: int = 40,
+        tool_hint_labels: dict[str, str] | None = None,
         set_tool_context: Callable[..., None] | None = None,
         on_iteration: Callable[[int], None] | None = None,
     ) -> None:
@@ -50,6 +51,7 @@ class AgentProgressHook(AgentHook):
         self._metadata = metadata or {}
         self._session_key = session_key
         self._tool_hint_max_length = tool_hint_max_length
+        self._tool_hint_labels = tool_hint_labels or {}
         self._set_tool_context = set_tool_context
         self._on_iteration = on_iteration
         self._stream_buf = ""
@@ -118,11 +120,13 @@ class AgentProgressHook(AgentHook):
                     await self._on_progress(thought)
             tool_hint = self._strip_think(self._tool_hint(context.tool_calls))
             tool_events = [build_tool_event_start_payload(tc) for tc in context.tool_calls]
+            humanized = humanize_tool_hints(context.tool_calls, self._tool_hint_labels)
             await invoke_on_progress(
                 self._on_progress,
                 tool_hint,
                 tool_hint=True,
                 tool_events=tool_events,
+                humanized_hint=humanized,
             )
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
