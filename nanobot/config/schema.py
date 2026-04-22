@@ -29,6 +29,7 @@ class ChannelsConfig(Base):
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
     transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
+    tool_hint_labels: dict[str, str] = Field(default_factory=dict)  # tool_name -> user-facing phrase (e.g. "Querying your data")
 
 
 class DreamConfig(Base):

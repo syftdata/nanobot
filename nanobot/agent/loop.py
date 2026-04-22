@@ -105,7 +105,11 @@ class _LoopHook(AgentHook):
                 if thought:
                     await self._on_progress(thought)
             tool_hint = self._loop._strip_think(self._loop._tool_hint(context.tool_calls))
-            await self._on_progress(tool_hint, tool_hint=True)
+            from nanobot.utils.tool_hints import humanize_tool_hints
+            labels = (self._loop.channels_config.tool_hint_labels
+                      if self._loop.channels_config else {})
+            humanized = humanize_tool_hints(context.tool_calls, labels)
+            await self._on_progress(tool_hint, tool_hint=True, humanized_hint=humanized)
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
@@ -899,10 +903,14 @@ class AgentLoop:
             chat_id=msg.chat_id,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+        async def _bus_progress(
+            content: str, *, tool_hint: bool = False, humanized_hint: str | None = None,
+        ) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
+            if humanized_hint:
+                meta["_humanized_tool_hint"] = humanized_hint
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel=msg.channel,

@@ -70,6 +70,7 @@ class SlackChannel(BaseChannel):
         self._target_cache: dict[str, str] = {}
         self._webhook_runner: Any | None = None
         self._mention_threads: OrderedDict[str, None] = OrderedDict()
+        self._fetched_thread_contexts: OrderedDict[str, None] = OrderedDict()
 
     async def start(self) -> None:
         """Start the Slack channel in the configured mode (socket or webhook)."""
@@ -198,6 +199,13 @@ class SlackChannel(BaseChannel):
                 else None
             )
 
+            # Route tool hints to typing status instead of posting as messages
+            if (msg.metadata or {}).get("_tool_hint"):
+                if self.config.typing_status and thread_ts:
+                    status_text = (msg.metadata or {}).get("_humanized_tool_hint") or msg.content or ""
+                    await self._set_typing_status(origin_chat_id, thread_ts, status_text)
+                return
+
             # Slack rejects empty text payloads. Keep media-only messages media-only,
             # but send a single blank message when the bot has no text or files to send.
             if msg.content or not (msg.media or []):
@@ -220,7 +228,11 @@ class SlackChannel(BaseChannel):
             # Update reaction emoji when the final (non-progress) response is sent
             if not (msg.metadata or {}).get("_progress"):
                 event = slack_meta.get("event", {})
-                await self._update_react_emoji(origin_chat_id, event.get("ts"))
+                msg_ts = event.get("ts")
+                if self.config.typing_status:
+                    await self._update_react_emoji(origin_chat_id, thread_ts or msg_ts)
+                else:
+                    await self._update_react_emoji(origin_chat_id, msg_ts)
 
         except Exception as e:
             logger.error("Error sending Slack message: {}", e)
@@ -409,6 +421,11 @@ class SlackChannel(BaseChannel):
         if self.config.reply_in_thread and not thread_ts:
             thread_ts = event.get("ts")
 
+        if thread_ts and event.get("thread_ts"):
+            thread_context = await self._fetch_thread_context(chat_id, thread_ts)
+            if thread_context:
+                text = f"{thread_context}\n\n{text}"
+
         if self.config.typing_status:
             await self._set_typing_status(chat_id, thread_ts or event.get("ts"), self.config.typing_status)
         else:
@@ -471,13 +488,60 @@ class SlackChannel(BaseChannel):
         if not self._web_client or not thread_ts:
             return
         try:
-            await self._web_client.assistant_threads_setStatus(
-                channel_id=channel_id,
-                thread_ts=thread_ts,
-                status=status,
-            )
+            kwargs: dict = {
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "status": status,
+            }
+            if status:
+                kwargs["loading_messages"] = [status]
+            await self._web_client.assistant_threads_setStatus(**kwargs)
         except Exception as e:
             logger.debug("Slack assistant_threads_setStatus failed: {}", e)
+
+    _MAX_THREAD_CONTEXTS = 1_000
+    _MAX_THREAD_REPLIES = 20
+
+    async def _fetch_thread_context(self, channel: str, thread_ts: str) -> str | None:
+        """Fetch prior messages in a Slack thread via conversations.replies.
+
+        Only fetches once per thread (tracked by _fetched_thread_contexts).
+        Returns a formatted context block or None if already fetched / no prior messages.
+        """
+        ctx_key = f"{channel}:{thread_ts}"
+        if ctx_key in self._fetched_thread_contexts:
+            return None
+        self._fetched_thread_contexts[ctx_key] = None
+        if len(self._fetched_thread_contexts) > self._MAX_THREAD_CONTEXTS:
+            self._fetched_thread_contexts.popitem(last=False)
+
+        if not self._web_client:
+            logger.debug("No web client, skipping thread context fetch for {}:{}", channel, thread_ts)
+            return None
+        try:
+            resp = await self._web_client.conversations_replies(
+                channel=channel, ts=thread_ts,
+                limit=self._MAX_THREAD_REPLIES, inclusive=True,
+            )
+            messages = resp.get("messages", [])
+            if len(messages) <= 1:
+                return None
+            prior = messages[:-1]
+            lines: list[str] = []
+            for m in prior:
+                user = m.get("user") or m.get("bot_id") or "unknown"
+                text = m.get("text") or ""
+                if not text and m.get("blocks"):
+                    text = "[Slack Block Kit message]"
+                lines.append(f"<@{user}>: {text}")
+            return (
+                "[Thread Context — prior messages in this Slack thread]\n"
+                + "\n".join(lines)
+                + "\n[/Thread Context]"
+            )
+        except Exception as e:
+            logger.warning("Failed to fetch thread context for {}:{}: {}", channel, thread_ts, e)
+            return None
 
     def _is_allowed(self, sender_id: str, chat_id: str, channel_type: str) -> bool:
         if channel_type == "im":

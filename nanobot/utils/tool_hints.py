@@ -135,3 +135,27 @@ def _fmt_fallback(tc) -> str:
     if not isinstance(val, str):
         return tc.name
     return f'{tc.name}("{abbreviate_path(val, 40)}")' if len(val) > 40 else f'{tc.name}("{val}")'
+
+
+def _title_case_from_tool_name(name: str) -> str:
+    """Convert a tool name like mcp_syft__query_entities to 'Query Entities'."""
+    stripped = name
+    if "__" in stripped:
+        stripped = stripped.split("__", 1)[-1]
+    elif stripped.startswith("mcp_"):
+        stripped = stripped.removeprefix("mcp_")
+        if "_" in stripped:
+            stripped = stripped.split("_", 1)[-1]
+    words = stripped.replace("_", " ").strip()
+    return words.title() if words else name
+
+
+def humanize_tool_hints(tool_calls: list, labels: dict[str, str]) -> str | None:
+    """Pick the last tool call's humanized label from config, with Title Case fallback."""
+    if not tool_calls or not labels:
+        return None
+    for tc in reversed(tool_calls):
+        label = labels.get(tc.name)
+        if label:
+            return label
+    return _title_case_from_tool_name(tool_calls[-1].name)
