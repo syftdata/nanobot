@@ -207,7 +207,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         content_type = ""
 
     agent_loop = request.app["agent_loop"]
-    timeout_s: float = request.app.get("request_timeout", 120.0)
+    timeout_s: float = request.app.get("request_timeout", 600.0)
     model_name: str = request.app.get("model_name", "nanobot")
 
     stream = False
@@ -419,7 +419,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 def create_app(
-    agent_loop, model_name: str = "nanobot", request_timeout: float = 120.0
+    agent_loop, model_name: str = "nanobot", request_timeout: float = 600.0
 ) -> web.Application:
     """Create the aiohttp application.
 
