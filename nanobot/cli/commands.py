@@ -501,6 +501,7 @@ def serve(
     from nanobot.agent.loop import AgentLoop
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
+    from nanobot.config.loader import get_config_path
     from nanobot.session.manager import SessionManager
 
     if verbose:
@@ -540,6 +541,7 @@ def serve(
         consolidation_ratio=runtime_config.agents.defaults.consolidation_ratio,
         max_messages=runtime_config.agents.defaults.max_messages,
         tools_config=runtime_config.tools,
+        config_path=get_config_path(),
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -559,6 +561,11 @@ def serve(
 
     async def on_startup(_app):
         await agent_loop._connect_mcp()
+        if hasattr(signal, "SIGHUP"):
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGHUP,
+                lambda: asyncio.create_task(agent_loop.reload_mcp()),
+            )
 
     async def on_cleanup(_app):
         await agent_loop.close_mcp()
@@ -602,6 +609,7 @@ def _run_gateway(
     from nanobot.agent.tools.message import MessageTool
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
+    from nanobot.config.loader import get_config_path
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
@@ -656,6 +664,7 @@ def _run_gateway(
         tools_config=config.tools,
         provider_snapshot_loader=load_provider_snapshot,
         provider_signature=provider_snapshot.signature,
+        config_path=get_config_path(),
     )
 
     from nanobot.agent.loop import UNIFIED_SESSION_KEY
@@ -950,6 +959,11 @@ def _run_gateway(
             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
 
     async def run():
+        if hasattr(signal, "SIGHUP"):
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGHUP,
+                lambda: asyncio.create_task(agent.reload_mcp()),
+            )
         try:
             await cron.start()
             await heartbeat.start()

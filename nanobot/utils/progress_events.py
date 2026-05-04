@@ -25,11 +25,14 @@ async def invoke_on_progress(
     *,
     tool_hint: bool = False,
     tool_events: list[dict[str, Any]] | None = None,
+    tool_hint_label: str | None = None,
 ) -> None:
+    kwargs: dict[str, Any] = {"tool_hint": tool_hint}
+    if tool_hint_label:
+        kwargs["tool_hint_label"] = tool_hint_label
     if tool_events and on_progress_accepts_tool_events(on_progress):
-        await on_progress(content, tool_hint=tool_hint, tool_events=tool_events)
-        return
-    await on_progress(content, tool_hint=tool_hint)
+        kwargs["tool_events"] = tool_events
+    await on_progress(content, **kwargs)
 
 
 def build_tool_event_start_payload(tool_call: Any) -> dict[str, Any]:

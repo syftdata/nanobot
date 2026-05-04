@@ -1,6 +1,6 @@
 """Tests for the MessageTool / tool_step bridging logic added to _LoopHook.
 
-These cover the ``after_execute_tools`` hook behaviour that lets the webapp's
+These cover the ``after_run_tool`` hook behaviour that lets the webapp's
 streaming ``/v1/chat/completions`` endpoint see tool activity:
 
   * MessageTool content is streamed via ``on_stream`` (so the webapp renders a
@@ -42,7 +42,7 @@ def _make_context(tool_calls: list[ToolCallRequest], tool_results: list[Any]) ->
 
 
 @pytest.mark.asyncio
-async def test_after_execute_tools_streams_message_tool_content_on_api_channel() -> None:
+async def test_after_run_tool_streams_message_tool_content_on_api_channel() -> None:
     """When the agent calls MessageTool on the api channel, its ``content``
     argument should be streamed via ``on_stream`` so the webapp sees a normal
     text reply (no bus subscriber exists for channel="api")."""
@@ -56,16 +56,14 @@ async def test_after_execute_tools_streams_message_tool_content_on_api_channel()
         on_stream=on_stream,
         channel="api",
     )
-    ctx = _make_context(
-        tool_calls=[_make_tool_call("message", {"content": "Here you go."})],
-        tool_results=["Message sent to api:default"],
-    )
-    await hook.after_execute_tools(ctx)
+    tc = _make_tool_call("message", {"content": "Here you go."})
+    ctx = _make_context(tool_calls=[tc], tool_results=["Message sent to api:default"])
+    await hook.after_run_tool(ctx, tc, "Message sent to api:default", None)
     assert deltas == ["Here you go."]
 
 
 @pytest.mark.asyncio
-async def test_after_execute_tools_strips_think_before_streaming() -> None:
+async def test_after_run_tool_strips_think_before_streaming() -> None:
     """strip_think should remove internal <think>...</think> blocks before
     the MessageTool content reaches the client, matching the transformation
     MessageTool.execute applies to its bus-bound copy."""
@@ -75,23 +73,19 @@ async def test_after_execute_tools_strips_think_before_streaming() -> None:
         deltas.append(delta)
 
     hook = _LoopHook(_loop_stub(), on_stream=on_stream, channel="api")
-    ctx = _make_context(
-        tool_calls=[
-            _make_tool_call(
-                "message",
-                {"content": "<think>secret reasoning</think>\nHello world"},
-            )
-        ],
-        tool_results=["ok"],
+    tc = _make_tool_call(
+        "message",
+        {"content": "<think>secret reasoning</think>\nHello world"},
     )
-    await hook.after_execute_tools(ctx)
+    ctx = _make_context(tool_calls=[tc], tool_results=["ok"])
+    await hook.after_run_tool(ctx, tc, "ok", None)
     joined = "".join(deltas)
     assert "secret reasoning" not in joined
     assert "Hello world" in joined
 
 
 @pytest.mark.asyncio
-async def test_after_execute_tools_does_not_stream_message_on_non_api_channel() -> None:
+async def test_after_run_tool_does_not_stream_message_on_non_api_channel() -> None:
     """For slack/feishu the MessageTool content already reaches the channel
     via its bus subscriber. Streaming it again via on_stream would duplicate
     the user-facing message."""
@@ -101,16 +95,14 @@ async def test_after_execute_tools_does_not_stream_message_on_non_api_channel() 
         deltas.append(delta)
 
     hook = _LoopHook(_loop_stub(), on_stream=on_stream, channel="slack")
-    ctx = _make_context(
-        tool_calls=[_make_tool_call("message", {"content": "hi"})],
-        tool_results=["ok"],
-    )
-    await hook.after_execute_tools(ctx)
+    tc = _make_tool_call("message", {"content": "hi"})
+    ctx = _make_context(tool_calls=[tc], tool_results=["ok"])
+    await hook.after_run_tool(ctx, tc, "ok", None)
     assert deltas == []
 
 
 @pytest.mark.asyncio
-async def test_after_execute_tools_emits_tool_step_for_non_message_tools() -> None:
+async def test_after_run_tool_emits_tool_step_for_non_message_tools() -> None:
     """Non-``message`` tool calls on the api channel should produce one
     ``tool_step`` payload per call with status="completed" and the
     arguments/result carried through for UI rendering."""
@@ -120,17 +112,10 @@ async def test_after_execute_tools_emits_tool_step_for_non_message_tools() -> No
         steps.append(payload)
 
     hook = _LoopHook(_loop_stub(), on_tool_step=on_tool_step, channel="api")
-    ctx = _make_context(
-        tool_calls=[
-            _make_tool_call(
-                "search_leads",
-                {"q": "top"},
-                call_id="ts_search_1",
-            )
-        ],
-        tool_results=[{"rows": [{"id": 1}, {"id": 2}]}],
-    )
-    await hook.after_execute_tools(ctx)
+    tc = _make_tool_call("search_leads", {"q": "top"}, call_id="ts_search_1")
+    result = {"rows": [{"id": 1}, {"id": 2}]}
+    ctx = _make_context(tool_calls=[tc], tool_results=[result])
+    await hook.after_run_tool(ctx, tc, result, None)
     assert len(steps) == 1
     step = steps[0]
     assert step["id"] == "ts_search_1"
@@ -141,21 +126,18 @@ async def test_after_execute_tools_emits_tool_step_for_non_message_tools() -> No
 
 
 @pytest.mark.asyncio
-async def test_after_execute_tools_skips_tool_step_without_callback() -> None:
+async def test_after_run_tool_skips_tool_step_without_callback() -> None:
     """If the caller did not supply an on_tool_step callback (e.g. cli/slack
     runs that don't care about intermediate UI cards), non-message tool
     results should simply be ignored rather than raise."""
     hook = _LoopHook(_loop_stub(), channel="api")
-    ctx = _make_context(
-        tool_calls=[_make_tool_call("search_leads", {})],
-        tool_results=["ok"],
-    )
-    # Should not raise.
-    await hook.after_execute_tools(ctx)
+    tc = _make_tool_call("search_leads", {})
+    ctx = _make_context(tool_calls=[tc], tool_results=["ok"])
+    await hook.after_run_tool(ctx, tc, "ok", None)
 
 
 @pytest.mark.asyncio
-async def test_after_execute_tools_handles_message_and_tool_mix() -> None:
+async def test_after_run_tool_handles_message_and_tool_mix() -> None:
     """A single iteration can contain both a message tool and other tools
     (rare but legal). We should stream the message content AND emit
     tool_step frames for the other tools."""
@@ -174,21 +156,23 @@ async def test_after_execute_tools_handles_message_and_tool_mix() -> None:
         on_tool_step=on_tool_step,
         channel="api",
     )
+    tc_search = _make_tool_call("search_leads", {"q": "top"}, call_id="ts_a")
+    tc_msg = _make_tool_call("message", {"content": "final answer"}, call_id="ts_b")
+    result_search = {"count": 1}
+    result_msg = "Message sent to api:default"
     ctx = _make_context(
-        tool_calls=[
-            _make_tool_call("search_leads", {"q": "top"}, call_id="ts_a"),
-            _make_tool_call("message", {"content": "final answer"}, call_id="ts_b"),
-        ],
-        tool_results=[{"count": 1}, "Message sent to api:default"],
+        tool_calls=[tc_search, tc_msg],
+        tool_results=[result_search, result_msg],
     )
-    await hook.after_execute_tools(ctx)
+    await hook.after_run_tool(ctx, tc_search, result_search, None)
+    await hook.after_run_tool(ctx, tc_msg, result_msg, None)
     assert deltas == ["final answer"]
     assert len(steps) == 1
     assert steps[0]["tool"] == "search_leads"
 
 
 @pytest.mark.asyncio
-async def test_after_execute_tools_summarizes_non_serializable_result() -> None:
+async def test_after_run_tool_summarizes_non_serializable_result() -> None:
     """Tool results that aren't JSON-serialisable should be coerced to a
     string so the tool_step payload stays JSON-safe on the wire."""
     steps: list[dict[str, Any]] = []
@@ -201,16 +185,15 @@ async def test_after_execute_tools_summarizes_non_serializable_result() -> None:
             return "<NotJsonable>"
 
     hook = _LoopHook(_loop_stub(), on_tool_step=on_tool_step, channel="api")
-    ctx = _make_context(
-        tool_calls=[_make_tool_call("weird_tool", {})],
-        tool_results=[NotJsonable()],
-    )
-    await hook.after_execute_tools(ctx)
+    tc = _make_tool_call("weird_tool", {})
+    result = NotJsonable()
+    ctx = _make_context(tool_calls=[tc], tool_results=[result])
+    await hook.after_run_tool(ctx, tc, result, None)
     assert steps[0]["output"] == "<NotJsonable>"
 
 
 def test_loophook_summarize_tool_result_strategies() -> None:
-    """Smoke-test the static helper used by after_execute_tools."""
+    """Smoke-test the static helper used by after_run_tool."""
     from nanobot.agent.loop import _LoopHook
 
     assert _LoopHook._summarize_tool_result(None) is None

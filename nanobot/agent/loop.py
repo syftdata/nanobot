@@ -123,12 +123,19 @@ class _LoopHook(AgentHook):
                 if thought:
                     await self._on_progress(thought)
             tool_hint = self._loop._strip_think(self._loop._tool_hint(context.tool_calls))
+            human_label: str | None = None
+            labels = getattr(self._loop.channels_config, "tool_hint_labels", None)
+            if labels:
+                from nanobot.utils.tool_hints import humanize_tool_hints
+
+                human_label = humanize_tool_hints(context.tool_calls, labels)
             tool_events = [build_tool_event_start_payload(tc) for tc in context.tool_calls]
             await invoke_on_progress(
                 self._on_progress,
                 tool_hint,
                 tool_hint=True,
                 tool_events=tool_events,
+                tool_hint_label=human_label,
             )
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
@@ -305,6 +312,7 @@ class AgentLoop:
         tools_config: ToolsConfig | None = None,
         provider_snapshot_loader: Callable[[], ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
+        config_path: Path | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -315,6 +323,7 @@ class AgentLoop:
         self.provider = provider
         self._provider_snapshot_loader = provider_snapshot_loader
         self._provider_signature = provider_signature
+        self._config_path = config_path
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = (
@@ -945,6 +954,35 @@ class AgentLoop:
                 logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
         self._mcp_stacks.clear()
 
+    async def reload_mcp(self) -> None:
+        """Re-read the config file and reconnect all MCP servers.
+
+        Intended to be triggered by a SIGHUP signal so that externally
+        rotated tokens (e.g. HubSpot OAuth access tokens written to
+        config.json by the polling service) are picked up without a
+        full process restart.  Sessions, conversation history, and all
+        non-MCP state are preserved.
+        """
+        from nanobot.config.loader import load_config, resolve_config_env_vars
+
+        logger.info("SIGHUP received — reloading MCP servers from config")
+        try:
+            config = resolve_config_env_vars(load_config(self._config_path))
+            new_mcp_servers = config.tools.mcp_servers
+        except Exception:
+            logger.exception("Failed to reload config for MCP refresh; keeping existing connections")
+            return
+
+        removed = self.tools.unregister_mcp_tools()
+        logger.info("Unregistered {} MCP tool(s)", removed)
+
+        await self.close_mcp()
+        self._mcp_connected = False
+        self._mcp_servers = new_mcp_servers
+
+        await self._connect_mcp()
+        logger.info("MCP servers reloaded successfully")
+
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
         task = asyncio.create_task(coro)
@@ -1121,10 +1159,14 @@ class AgentLoop:
             *,
             tool_hint: bool = False,
             tool_events: list[dict[str, Any]] | None = None,
+            tool_hint_label: str | None = None,
+            **_extra: Any,
         ) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
+            if tool_hint_label:
+                meta["_tool_hint_label"] = tool_hint_label
             if tool_events:
                 meta["_tool_events"] = tool_events
             await self.bus.publish_outbound(
