@@ -7,6 +7,7 @@ All requests route to a single persistent API session.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json as _json
 import time
 import uuid
@@ -18,8 +19,12 @@ from loguru import logger
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
-    FileSizeExceeded as _FileSizeExceeded,
     MAX_FILE_SIZE,
+)
+from nanobot.utils.media_decode import (
+    FileSizeExceeded as _FileSizeExceeded,
+)
+from nanobot.utils.media_decode import (
     save_base64_data_url as _save_base64_data_url,
 )
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
@@ -260,20 +265,16 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         #   None                                   -> sentinel; end the stream
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         stream_failed = False
+        emitted_content = False
 
         async def _on_stream(token: str) -> None:
+            nonlocal emitted_content
             if token:
+                emitted_content = True
                 await queue.put({"kind": "text", "text": token})
 
-        async def _on_stream_end(*_a: Any, **kw: Any) -> None:
-            # The agent loop fires on_stream_end once per LLM call. When tools
-            # are about to run (``resuming=True``) the stream isn't actually
-            # over, so we must NOT close the queue — otherwise tool_step
-            # frames and follow-up text would be dropped. The ``finally``
-            # branch of ``_run`` handles the terminal close.
-            if kw.get("resuming"):
-                return
-            await queue.put(None)
+        async def _on_stream_end(*_a: Any, **_kw: Any) -> None:
+            return None
 
         async def _on_tool_step(payload: dict[str, Any]) -> None:
             await queue.put({"kind": "tool_step", "payload": payload})
@@ -282,7 +283,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             nonlocal stream_failed
             try:
                 async with session_lock:
-                    await asyncio.wait_for(
+                    response = await asyncio.wait_for(
                         agent_loop.process_direct(
                             content=text,
                             media=media_paths if media_paths else None,
@@ -295,6 +296,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         ),
                         timeout=timeout_s,
                     )
+                    if not emitted_content:
+                        response_text = _response_text(response)
+                        if response_text.strip():
+                            await queue.put({"kind": "text", "text": response_text})
             except Exception:
                 stream_failed = True
                 logger.exception("Streaming error for session {}", session_key)
@@ -315,20 +320,16 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                 elif kind == "tool_step":
                     await resp.write(_sse_tool_step(item.get("payload") or {}))
         finally:
-            task.cancel()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
         if not stream_failed:
             await resp.write(_sse_chunk("", model_name, chunk_id, finish_reason="stop"))
             await resp.write(_SSE_DONE)
         return resp
 
-    # -- non-streaming path --
-    # When the agent uses MessageTool on the ``api`` channel, _process_message
-    # now surfaces the tool's content as the OutboundMessage return value
-    # (see agent/loop.py post-loop MessageTool block) so we no longer need the
-    # blind retry that was previously required to work around empty returns.
-    # We still keep a terminal fallback for the (rare) case where neither the
-    # LLM's direct text nor MessageTool produced any content.
     _FALLBACK = EMPTY_FINAL_RESPONSE_MESSAGE
 
     try:
@@ -347,9 +348,6 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                 response_text = _response_text(response)
 
                 if not response_text or not response_text.strip():
-                    # Last-resort: if MessageTool fired during the turn but the
-                    # OutboundMessage path didn't carry the content for some
-                    # reason, read it directly from the tool before falling back.
                     mt = None
                     try:
                         mt = agent_loop.tools.get("message")
