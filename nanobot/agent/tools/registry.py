@@ -27,6 +27,19 @@ class ToolRegistry:
         self._tools.pop(name, None)
         self._cached_definitions = None
 
+    def unregister_mcp_tools(self) -> int:
+        """Remove all MCP-prefixed tools (``mcp_*``).
+
+        Returns the number of tools removed.  Used by :meth:`AgentLoop.reload_mcp`
+        to clear stale tool wrappers before reconnecting MCP servers.
+        """
+        mcp_names = [name for name in self._tools if name.startswith("mcp_")]
+        for name in mcp_names:
+            del self._tools[name]
+        if mcp_names:
+            self._cached_definitions = None
+        return len(mcp_names)
+
     def get(self, name: str) -> Tool | None:
         """Get a tool by name."""
         return self._tools.get(name)

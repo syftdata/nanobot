@@ -656,6 +656,7 @@ def serve(
 
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
+    from nanobot.config.loader import get_config_path
     from nanobot.providers.image_generation import image_gen_provider_configs
     from nanobot.session.manager import SessionManager
 
@@ -677,6 +678,7 @@ def serve(
             runtime_config, bus,
             session_manager=session_manager,
             image_generation_provider_configs=image_gen_provider_configs(runtime_config),
+            config_path=get_config_path(),
         )
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")
@@ -699,6 +701,11 @@ def serve(
 
     async def on_startup(_app):
         await agent_loop._connect_mcp()
+        if hasattr(signal, "SIGHUP"):
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGHUP,
+                lambda: asyncio.create_task(agent_loop.reload_mcp()),
+            )
 
     async def on_cleanup(_app):
         await agent_loop.close_mcp()
@@ -755,6 +762,8 @@ def _run_gateway(
     from nanobot.bus.queue import MessageBus
     from nanobot.bus.runtime_events import RuntimeEventBus
     from nanobot.channels.manager import ChannelManager
+    from nanobot.channels.websocket import publish_runtime_model_update
+    from nanobot.config.loader import get_config_path
     from nanobot.cron.bound_runner import run_bound_cron_job
     from nanobot.cron.service import CronJobSkippedError, CronService
     from nanobot.cron.session_turns import is_bound_cron_job
@@ -799,6 +808,7 @@ def _run_gateway(
         runtime_events=runtime_events,
         provider_signature=provider_snapshot.signature,
         hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
+        config_path=get_config_path(),
     )
     WebuiTurnCoordinator(
         bus=bus,
@@ -1130,6 +1140,11 @@ def _run_gateway(
             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
 
     async def run():
+        if hasattr(signal, "SIGHUP"):
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGHUP,
+                lambda: asyncio.create_task(agent.reload_mcp()),
+            )
         try:
             await cron.start()
             tasks = [

@@ -33,13 +33,13 @@ async def invoke_on_progress(
     *,
     tool_hint: bool = False,
     tool_events: list[dict[str, Any]] | None = None,
-    humanized_hint: str | None = None,
+    tool_hint_label: str | None = None,
 ) -> None:
     kwargs: dict[str, Any] = {"tool_hint": tool_hint}
     if tool_events and on_progress_accepts_tool_events(on_progress):
         kwargs["tool_events"] = tool_events
-    if humanized_hint is not None and _on_progress_accepts(on_progress, "humanized_hint"):
-        kwargs["humanized_hint"] = humanized_hint
+    if tool_hint_label and _on_progress_accepts(on_progress, "tool_hint_label"):
+        kwargs["tool_hint_label"] = tool_hint_label
     await on_progress(content, **kwargs)
 
 

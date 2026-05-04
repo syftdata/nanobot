@@ -120,13 +120,13 @@ class AgentProgressHook(AgentHook):
                     await self._on_progress(thought)
             tool_hint = self._strip_think(self._tool_hint(context.tool_calls))
             tool_events = [build_tool_event_start_payload(tc) for tc in context.tool_calls]
-            humanized = humanize_tool_hints(context.tool_calls, self._tool_hint_labels)
+            tool_hint_label = humanize_tool_hints(context.tool_calls, self._tool_hint_labels)
             await invoke_on_progress(
                 self._on_progress,
                 tool_hint,
                 tool_hint=True,
                 tool_events=tool_events,
-                humanized_hint=humanized,
+                tool_hint_label=tool_hint_label,
             )
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)

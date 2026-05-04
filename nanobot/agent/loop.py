@@ -215,6 +215,7 @@ class AgentLoop:
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         runtime_events: RuntimeEventBus | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
+        config_path: Path | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -230,6 +231,7 @@ class AgentLoop:
         self._runtime_model_publisher = runtime_model_publisher
         self._provider_signature = provider_signature
         self._default_selection_signature = preset_helpers.default_selection_signature(provider_signature)
+        self._config_path = config_path
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = (
@@ -1123,6 +1125,35 @@ class AgentLoop:
             except (RuntimeError, BaseExceptionGroup):
                 logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
         self._mcp_stacks.clear()
+
+    async def reload_mcp(self) -> None:
+        """Re-read the config file and reconnect all MCP servers.
+
+        Intended to be triggered by a SIGHUP signal so that externally
+        rotated tokens (e.g. HubSpot OAuth access tokens written to
+        config.json by the polling service) are picked up without a
+        full process restart.  Sessions, conversation history, and all
+        non-MCP state are preserved.
+        """
+        from nanobot.config.loader import load_config, resolve_config_env_vars
+
+        logger.info("SIGHUP received — reloading MCP servers from config")
+        try:
+            config = resolve_config_env_vars(load_config(self._config_path))
+            new_mcp_servers = config.tools.mcp_servers
+        except Exception:
+            logger.exception("Failed to reload config for MCP refresh; keeping existing connections")
+            return
+
+        removed = self.tools.unregister_mcp_tools()
+        logger.info("Unregistered {} MCP tool(s)", removed)
+
+        await self.close_mcp()
+        self._mcp_connected = False
+        self._mcp_servers = new_mcp_servers
+
+        await self._connect_mcp()
+        logger.info("MCP servers reloaded successfully")
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""

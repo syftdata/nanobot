@@ -1,5 +1,7 @@
 """Slack channel implementation using Socket Mode or Webhook."""
 
+from __future__ import annotations
+
 import asyncio
 import re
 from collections import OrderedDict
@@ -41,6 +43,7 @@ class SlackConfig(Base):
     webhook_port: int = 18800
     webhook_secret: str = ""
     bot_token: str = ""
+    channel_tokens: dict[str, str] = Field(default_factory=dict)
     app_token: str = ""
     user_token_read_only: bool = True
     reply_in_thread: bool = True
@@ -89,13 +92,24 @@ class SlackChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: SlackConfig = config
         self._web_client: AsyncWebClient | None = None
+        self._channel_clients: dict[str, AsyncWebClient] = {}
         self._socket_client: Any | None = None
         self._bot_user_id: str | None = None
+        self._all_bot_user_ids: set[str] = set()
         self._target_cache: dict[str, str] = {}
         self._thread_context_attempted: set[str] = set()
         self._webhook_runner: Any | None = None
         self._mention_threads: OrderedDict[str, None] = OrderedDict()
         self._fetched_thread_contexts: OrderedDict[str, None] = OrderedDict()
+
+    def _get_client(self, channel_id: str | None = None) -> AsyncWebClient | None:
+        """Get the appropriate Slack client for the given channel."""
+        if not channel_id:
+            return self._web_client
+        token = self.config.channel_tokens.get(channel_id)
+        if not token or token not in self._channel_clients:
+            return self._web_client
+        return self._channel_clients[token]
 
     async def start(self) -> None:
         """Start the Slack channel in the configured mode (socket or webhook)."""
@@ -109,9 +123,25 @@ class SlackChannel(BaseChannel):
         try:
             auth = await self._web_client.auth_test()
             self._bot_user_id = auth.get("user_id")
+            if self._bot_user_id:
+                self._all_bot_user_ids.add(self._bot_user_id)
             self.logger.info("bot connected as {}", self._bot_user_id)
         except Exception as e:
             self.logger.warning("auth_test failed: {}", e)
+
+        for token in set(self.config.channel_tokens.values()):
+            if token == self.config.bot_token or token in self._channel_clients:
+                continue
+            try:
+                client = AsyncWebClient(token=token)
+                auth = await client.auth_test()
+                user_id = auth.get("user_id")
+                if user_id:
+                    self._all_bot_user_ids.add(user_id)
+                logger.info("Other slack bots connected as {}", user_id)
+                self._channel_clients[token] = client
+            except Exception as e:
+                logger.warning("Slack auth_test failed for channel token: {}", e)
 
         if self.config.mode == "socket":
             await self._start_socket_mode()
@@ -229,6 +259,11 @@ class SlackChannel(BaseChannel):
             slack_meta = msg.metadata.get("slack", {}) if msg.metadata else {}
             thread_ts = slack_meta.get("thread_ts")
             origin_chat_id = str((slack_meta.get("event", {}) or {}).get("channel") or msg.chat_id)
+            client = self._get_client(origin_chat_id)
+            if not client:
+                logger.error("Slack client not available for chat_id: {}", origin_chat_id)
+                return
+
             # Reply in the same thread the inbound message belongs to (works
             # for both real channel threads and DM threads). When the agent
             # is forwarding to a different channel, drop thread_ts because it
@@ -238,7 +273,7 @@ class SlackChannel(BaseChannel):
             # Route tool hints to typing status instead of posting as messages.
             if (msg.metadata or {}).get("_tool_hint"):
                 if self.config.typing_status and thread_ts:
-                    status_text = (msg.metadata or {}).get("_humanized_tool_hint") or msg.content or ""
+                    status_text = (msg.metadata or {}).get("_tool_hint_label") or msg.content or ""
                     await self._set_typing_status(origin_chat_id, thread_ts, status_text)
                 return
 
@@ -255,11 +290,11 @@ class SlackChannel(BaseChannel):
                     )
                     if buttons and index == len(chunks) - 1:
                         kwargs["blocks"] = self._build_button_blocks(chunk, buttons)
-                    await self._web_client.chat_postMessage(**kwargs)
+                    await client.chat_postMessage(**kwargs)
 
             for media_path in msg.media or []:
                 try:
-                    await self._web_client.files_upload_v2(
+                    await client.files_upload_v2(
                         channel=target_chat_id,
                         file=media_path,
                         thread_ts=thread_ts_param,
@@ -317,9 +352,13 @@ class SlackChannel(BaseChannel):
         if cache_key in self._target_cache:
             return self._target_cache[cache_key]
 
+        client = self._get_client()
+        if not client:
+            raise ValueError("Slack client not available")
+
         cursor: str | None = None
         while True:
-            response = await self._web_client.conversations_list(
+            response = await client.conversations_list(
                 types="public_channel,private_channel",
                 exclude_archived=True,
                 limit=200,
@@ -349,9 +388,13 @@ class SlackChannel(BaseChannel):
         if cache_key in self._target_cache:
             return self._target_cache[cache_key]
 
+        client = self._get_client()
+        if not client:
+            raise ValueError("Slack client not available")
+
         cursor: str | None = None
         while True:
-            response = await self._web_client.users_list(limit=200, cursor=cursor)
+            response = await client.users_list(limit=200, cursor=cursor)
             for member in response.get("members", []):
                 if self._member_matches_handle(member, normalized):
                     user_id = str(member.get("id") or "")
@@ -369,7 +412,10 @@ class SlackChannel(BaseChannel):
         )
 
     async def _open_dm_for_user(self, user_id: str) -> str:
-        response = await self._web_client.conversations_open(users=user_id)
+        client = self._get_client()
+        if not client:
+            raise ValueError("Slack client not available")
+        response = await client.conversations_open(users=user_id)
         channel_id = str(((response.get("channel") or {}).get("id")) or "")
         if not channel_id:
             raise ValueError(f"Slack DM target for user '{user_id}' could not be opened.")
@@ -425,11 +471,11 @@ class SlackChannel(BaseChannel):
         # Ignore other subtypes such as bot_message / message_changed / deleted.
         if subtype and subtype != "file_share":
             return
-        if self._bot_user_id and sender_id == self._bot_user_id:
+        if sender_id in self._all_bot_user_ids:
             return
 
         text = event.get("text") or ""
-        if event_type == "message" and self._bot_user_id and f"<@{self._bot_user_id}>" in text:
+        if event_type == "message" and any(f"<@{bot_id}>" in text for bot_id in self._all_bot_user_ids):
             return
 
         # Debug: log basic event shape
@@ -491,8 +537,9 @@ class SlackChannel(BaseChannel):
             )
         else:
             try:
-                if self._web_client and event.get("ts"):
-                    await self._web_client.reactions_add(
+                client = self._get_client(chat_id)
+                if client and event.get("ts"):
+                    await client.reactions_add(
                         channel=chat_id,
                         name=self.config.react_emoji,
                         timestamp=event.get("ts"),
@@ -641,9 +688,10 @@ class SlackChannel(BaseChannel):
     ) -> str:
         """Include thread history the first time the bot is pulled into a Slack thread."""
         del channel_type  # DM and channel threads are both fetched via conversations.replies
+        client = self._get_client(chat_id)
         if (
             not self.config.include_thread_context
-            or not self._web_client
+            or not client
             or not raw_thread_ts
             or not thread_ts
             or current_ts == thread_ts
@@ -658,7 +706,7 @@ class SlackChannel(BaseChannel):
         self._thread_context_attempted.add(key)
 
         try:
-            response = await self._web_client.conversations_replies(
+            response = await client.conversations_replies(
                 channel=chat_id,
                 ts=thread_ts,
                 limit=max(1, self.config.thread_context_limit),
@@ -683,7 +731,7 @@ class SlackChannel(BaseChannel):
             if item.get("subtype"):
                 continue
             sender = str(item.get("user") or item.get("bot_id") or "unknown")
-            is_bot = self._bot_user_id is not None and sender == self._bot_user_id
+            is_bot = sender == self._bot_user_id or sender in self._all_bot_user_ids
             label = "bot" if is_bot else f"<@{sender}>"
             text = str(item.get("text") or "").strip()
             if not text:
@@ -715,13 +763,14 @@ class SlackChannel(BaseChannel):
 
     async def _update_react_emoji(self, chat_id: str, ts: str | None) -> None:
         """Clear the processing indicator (typing status or reaction emoji)."""
-        if not self._web_client or not ts:
+        client = self._get_client(chat_id)
+        if not client or not ts:
             return
         if self.config.typing_status:
             await self._set_typing_status(chat_id, ts, "")
             return
         try:
-            await self._web_client.reactions_remove(
+            await client.reactions_remove(
                 channel=chat_id,
                 name=self.config.react_emoji,
                 timestamp=ts,
@@ -730,7 +779,7 @@ class SlackChannel(BaseChannel):
             self.logger.debug("reactions_remove failed: {}", e)
         if self.config.done_emoji:
             try:
-                await self._web_client.reactions_add(
+                await client.reactions_add(
                     channel=chat_id,
                     name=self.config.done_emoji,
                     timestamp=ts,
@@ -740,7 +789,8 @@ class SlackChannel(BaseChannel):
 
     async def _set_typing_status(self, channel_id: str, thread_ts: str | None, status: str) -> None:
         """Set or clear the assistant typing status indicator on a thread."""
-        if not self._web_client or not thread_ts:
+        client = self._get_client(channel_id)
+        if not client or not thread_ts:
             return
         try:
             kwargs: dict = {
@@ -750,7 +800,7 @@ class SlackChannel(BaseChannel):
             }
             if status:
                 kwargs["loading_messages"] = [status]
-            await self._web_client.assistant_threads_setStatus(**kwargs)
+            await client.assistant_threads_setStatus(**kwargs)
         except Exception as e:
             self.logger.debug("assistant_threads_setStatus failed: {}", e)
 
@@ -814,7 +864,7 @@ class SlackChannel(BaseChannel):
     def _is_mention(self, event_type: str, text: str) -> bool:
         if event_type == "app_mention":
             return True
-        return self._bot_user_id is not None and f"<@{self._bot_user_id}>" in text
+        return any(f"<@{bot_id}>" in text for bot_id in self._all_bot_user_ids)
 
     def _should_respond_in_channel(
         self, event_type: str, text: str, chat_id: str, thread_ts: str | None = None,
@@ -859,9 +909,14 @@ class SlackChannel(BaseChannel):
                 self._mention_threads.popitem(last=False)
 
     def _strip_bot_mention(self, text: str) -> str:
-        if not text or not self._bot_user_id:
+        bot_ids = set(self._all_bot_user_ids)
+        if self._bot_user_id:
+            bot_ids.add(self._bot_user_id)
+        if not text or not bot_ids:
             return text
-        return re.sub(rf"<@{re.escape(self._bot_user_id)}>\s*", "", text).strip()
+        for bot_id in sorted(bot_ids, key=len, reverse=True):
+            text = re.sub(rf"<@{re.escape(bot_id)}>\s*", "", text)
+        return text.strip()
 
     _TABLE_RE = re.compile(r"(?m)^\|.*\|$(?:\n\|[\s:|-]*\|$)(?:\n\|.*\|$)*")
     _CODE_FENCE_RE = re.compile(r"```[\s\S]*?```")

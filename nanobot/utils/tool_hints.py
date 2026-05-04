@@ -143,15 +143,30 @@ def _fmt_fallback(tc, max_length: int = 40) -> str:
 
 
 def _title_case_from_tool_name(name: str) -> str:
-    """Convert a tool name like mcp_syft__query_entities to 'Query Entities'."""
-    stripped = name
-    if "__" in stripped:
-        stripped = stripped.split("__", 1)[-1]
-    elif stripped.startswith("mcp_"):
-        stripped = stripped.removeprefix("mcp_")
-        if "_" in stripped:
-            stripped = stripped.split("_", 1)[-1]
-    words = stripped.replace("_", " ").strip()
+    """Convert an MCP tool name to a human-readable Title Case string.
+
+    Naming convention: ``mcp_{server}_{tool}`` (single underscore).
+    Strips the ``mcp_`` prefix, then the server name, then a repeated
+    server-name prefix inside the tool portion (common with HubSpot
+    tools like ``mcp_hubspot_hubspot-search-objects`` → "Search Objects").
+    """
+    if not name.startswith("mcp_"):
+        words = name.replace("_", " ").replace("-", " ").strip()
+        return words.title() if words else name
+
+    rest = name.removeprefix("mcp_")
+    if "_" in rest:
+        server, tool_part = rest.split("_", 1)
+    else:
+        server, tool_part = rest, ""
+
+    for sep in ("-", "_"):
+        if tool_part.startswith(server + sep):
+            tool_part = tool_part[len(server) + 1 :]
+            break
+
+    target = tool_part or server
+    words = target.replace("_", " ").replace("-", " ").strip()
     return words.title() if words else name
 
 
