@@ -1139,7 +1139,55 @@ def _run_gateway(
         except Exception as e:
             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
 
+    async def _send_farewell(reason: str = "restarting") -> None:
+        """Send a brief farewell to recently-active Slack conversations.
+
+        Only targets sessions updated within the last 24 hours so dormant
+        channels don't get noisy restart notices.
+        """
+        from datetime import datetime, timedelta, timezone as tz
+
+        from nanobot.bus.events import OutboundMessage
+
+        slack_channel = channels.get_channel("slack")
+        if not slack_channel or not getattr(slack_channel, "_web_client", None):
+            return
+
+        cutoff = (datetime.now(tz.utc) - timedelta(hours=2)).isoformat()
+        targets: list[tuple[str, str]] = []
+
+        for item in session_manager.list_sessions():
+            key = item.get("key") or ""
+            if ":" not in key:
+                continue
+            channel, chat_id = key.split(":", 1)
+            if channel != "slack" or not chat_id:
+                continue
+            updated = item.get("updated_at") or ""
+            if updated > cutoff:
+                targets.append((channel, chat_id))
+
+        if not targets:
+            return
+
+        if reason == "crash":
+            text = ":warning: I crashed unexpectedly and I'm restarting. I'll be back in a moment."
+        else:
+            text = ":arrows_counterclockwise: I'm restarting — I'll be back in a moment."
+
+        for channel_name, chat_id in targets:
+            try:
+                await slack_channel.send(
+                    OutboundMessage(channel=channel_name, chat_id=chat_id, content=text)
+                )
+            except Exception:
+                logger.debug("Failed to send farewell to {}:{}", channel_name, chat_id)
+
+    shutdown_reason = "signal"
+
     async def run():
+        nonlocal shutdown_reason
+
         if hasattr(signal, "SIGHUP"):
             asyncio.get_running_loop().add_signal_handler(
                 signal.SIGHUP,
@@ -1161,9 +1209,14 @@ def _run_gateway(
         except Exception:
             import traceback
 
+            shutdown_reason = "crash"
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
+            try:
+                await _send_farewell(shutdown_reason)
+            except Exception:
+                logger.debug("Farewell messages failed during shutdown")
             await agent.close_mcp()
             cron.stop()
             agent.stop()
