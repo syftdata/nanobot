@@ -445,7 +445,7 @@ async def test_with_thread_context_fetches_root_once() -> None:
     assert "Slack thread context before this mention:" in content
     assert "- <@UROOT>: drink water" in content
     assert "- <@U2>: good idea" in content
-    assert "- bot: I'll remind you." in content
+    assert "- <@UBOT>: I'll remind you." in content
     assert "U3" not in content
     assert content.endswith("Current message:\nwhat did you see?")
 
@@ -559,6 +559,7 @@ async def test_dm_thread_message_keeps_thread_ts_and_threaded_session() -> None:
 async def test_slack_slash_command_skips_thread_context() -> None:
     channel = SlackChannel(SlackConfig(enabled=True, allow_from=[]), MessageBus())
     channel._bot_user_id = "UBOT"
+    channel._all_bot_user_ids = {"UBOT"}
     channel._with_thread_context = AsyncMock(return_value="wrapped")  # type: ignore[method-assign]
     channel._handle_message = AsyncMock()  # type: ignore[method-assign]
     client = SimpleNamespace(send_socket_mode_response=AsyncMock())
