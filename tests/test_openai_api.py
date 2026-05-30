@@ -357,6 +357,7 @@ async def test_empty_response_retry_then_success(aiohttp_client) -> None:
     agent.process_direct = sometimes_empty
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
+    agent.tools.get.return_value = None
 
     app = create_app(agent, model_name="m")
     client = await aiohttp_client(app)
@@ -386,6 +387,7 @@ async def test_empty_response_falls_back(aiohttp_client) -> None:
     agent.process_direct = always_empty
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
+    agent.tools.get.return_value = None
 
     app = create_app(agent, model_name="m")
     client = await aiohttp_client(app)
@@ -409,7 +411,7 @@ async def test_process_direct_accepts_media() -> None:
 
     captured_msg = None
 
-    async def fake_process(msg, *, session_key="", on_progress=None, on_stream=None, on_stream_end=None):
+    async def fake_process(msg, *, session_key="", on_progress=None, on_stream=None, on_stream_end=None, on_tool_step=None):
         nonlocal captured_msg
         captured_msg = msg
         return None

@@ -968,7 +968,7 @@ class AgentLoop:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
-        for name, stack in self._mcp_stacks.items():
+        for name, stack in list(self._mcp_stacks.items()):
             try:
                 await stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
