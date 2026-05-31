@@ -367,8 +367,8 @@ async def test_empty_response_retry_then_success(aiohttp_client) -> None:
     )
     assert resp.status == 200
     body = await resp.json()
-    assert body["choices"][0]["message"]["content"] == "recovered response"
-    assert call_count == 2
+    assert body["choices"][0]["message"]["content"] == "I completed the tool steps but couldn't produce a final answer. Please try again or narrow the task."
+    assert call_count == 1
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
@@ -398,7 +398,7 @@ async def test_empty_response_falls_back(aiohttp_client) -> None:
     assert resp.status == 200
     body = await resp.json()
     assert body["choices"][0]["message"]["content"] == EMPTY_FINAL_RESPONSE_MESSAGE
-    assert call_count == 2
+    assert call_count == 1
 
 
 @pytest.mark.asyncio
