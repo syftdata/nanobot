@@ -762,7 +762,6 @@ def _run_gateway(
     from nanobot.bus.queue import MessageBus
     from nanobot.bus.runtime_events import RuntimeEventBus
     from nanobot.channels.manager import ChannelManager
-    from nanobot.channels.websocket import publish_runtime_model_update
     from nanobot.config.loader import get_config_path
     from nanobot.cron.bound_runner import run_bound_cron_job
     from nanobot.cron.service import CronJobSkippedError, CronService
@@ -1145,7 +1144,8 @@ def _run_gateway(
         Only targets sessions updated within the last 24 hours so dormant
         channels don't get noisy restart notices.
         """
-        from datetime import datetime, timedelta, timezone as tz
+        from datetime import datetime, timedelta
+        from datetime import timezone as tz
 
         from nanobot.bus.events import OutboundMessage
 

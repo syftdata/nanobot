@@ -445,7 +445,7 @@ async def test_with_thread_context_fetches_root_once() -> None:
     assert "Slack thread context before this mention:" in content
     assert "- <@UROOT>: drink water" in content
     assert "- <@U2>: good idea" in content
-    assert "- <@UBOT>: I'll remind you." in content
+    assert "- bot: I'll remind you." in content
     assert "U3" not in content
     assert content.endswith("Current message:\nwhat did you see?")
 

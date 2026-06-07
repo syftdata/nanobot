@@ -138,10 +138,10 @@ class SlackChannel(BaseChannel):
                 user_id = auth.get("user_id")
                 if user_id:
                     self._all_bot_user_ids.add(user_id)
-                logger.info("Other slack bots connected as {}", user_id)
+                self.logger.info("Other slack bots connected as {}", user_id)
                 self._channel_clients[token] = client
             except Exception as e:
-                logger.warning("Slack auth_test failed for channel token: {}", e)
+                self.logger.warning("Slack auth_test failed for channel token: {}", e)
 
         if self.config.mode == "socket":
             await self._start_socket_mode()
@@ -261,7 +261,7 @@ class SlackChannel(BaseChannel):
             origin_chat_id = str((slack_meta.get("event", {}) or {}).get("channel") or msg.chat_id)
             client = self._get_client(origin_chat_id)
             if not client:
-                logger.error("Slack client not available for chat_id: {}", origin_chat_id)
+                self.logger.error("Slack client not available for chat_id: {}", origin_chat_id)
                 return
 
             # Reply in the same thread the inbound message belongs to (works
@@ -864,7 +864,10 @@ class SlackChannel(BaseChannel):
     def _is_mention(self, event_type: str, text: str) -> bool:
         if event_type == "app_mention":
             return True
-        return any(f"<@{bot_id}>" in text for bot_id in self._all_bot_user_ids)
+        bot_ids = set(self._all_bot_user_ids)
+        if self._bot_user_id:
+            bot_ids.add(self._bot_user_id)
+        return any(f"<@{bot_id}>" in text for bot_id in bot_ids)
 
     def _should_respond_in_channel(
         self, event_type: str, text: str, chat_id: str, thread_ts: str | None = None,

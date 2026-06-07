@@ -67,7 +67,7 @@ def test_sse_tool_step_frame_shape() -> None:
     raw = _sse_tool_step(payload).decode()
     assert raw.startswith("event: tool_step\n")
     assert raw.endswith("\n\n")
-    data_line = [l for l in raw.split("\n") if l.startswith("data: ")][0]
+    data_line = [ln for ln in raw.split("\n") if ln.startswith("data: ")][0]
     parsed = json.loads(data_line[len("data: "):])
     assert parsed == payload
 
@@ -403,7 +403,7 @@ async def test_stream_forwards_on_tool_step_frames(aiohttp_client) -> None:
     ts_frame = [
         block for block in body.split("\n\n") if block.startswith("event: tool_step")
     ][0]
-    data_line = [l for l in ts_frame.split("\n") if l.startswith("data: ")][0]
+    data_line = [ln for ln in ts_frame.split("\n") if ln.startswith("data: ")][0]
     parsed = json.loads(data_line[len("data: "):])
     assert parsed["id"] == "ts_1"
     assert parsed["tool"] == "search_leads"
@@ -412,11 +412,11 @@ async def test_stream_forwards_on_tool_step_frames(aiohttp_client) -> None:
     # Text deltas before and after the tool step should still appear as
     # standard OpenAI-style chunks.
     text_lines = [
-        l[len("data: "):]
-        for l in body.split("\n")
-        if l.startswith("data: ") and l != "data: [DONE]"
+        ln[len("data: "):]
+        for ln in body.split("\n")
+        if ln.startswith("data: ") and ln != "data: [DONE]"
     ]
-    text_chunks = [json.loads(l) for l in text_lines if '"delta"' in l]
+    text_chunks = [json.loads(ln) for ln in text_lines if '"delta"' in ln]
     content_deltas = [
         c["choices"][0]["delta"].get("content", "")
         for c in text_chunks
@@ -461,11 +461,11 @@ async def test_stream_message_tool_content_surfaces_as_text(aiohttp_client) -> N
 
     # A text-delta frame with the MessageTool content should appear.
     text_lines = [
-        l[len("data: "):]
-        for l in body.split("\n")
-        if l.startswith("data: ") and l != "data: [DONE]"
+        ln[len("data: "):]
+        for ln in body.split("\n")
+        if ln.startswith("data: ") and ln != "data: [DONE]"
     ]
-    chunks = [json.loads(l) for l in text_lines]
+    chunks = [json.loads(ln) for ln in text_lines]
     combined = "".join(
         c["choices"][0]["delta"].get("content", "") or ""
         for c in chunks
@@ -511,11 +511,11 @@ async def test_stream_resuming_stream_end_does_not_close_response(aiohttp_client
     # Both deltas should be present; the resuming=True end must not have
     # truncated the stream.
     text_lines = [
-        l[len("data: "):]
-        for l in body.split("\n")
-        if l.startswith("data: ") and l != "data: [DONE]"
+        ln[len("data: "):]
+        for ln in body.split("\n")
+        if ln.startswith("data: ") and ln != "data: [DONE]"
     ]
-    chunks = [json.loads(l) for l in text_lines]
+    chunks = [json.loads(ln) for ln in text_lines]
     combined = "".join(
         c["choices"][0]["delta"].get("content", "") or ""
         for c in chunks
