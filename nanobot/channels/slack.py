@@ -235,6 +235,10 @@ class SlackChannel(BaseChannel):
         try:
             target_chat_id = await self._resolve_target_chat_id(msg.chat_id)
             slack_meta = msg.metadata.get("slack", {}) if msg.metadata else {}
+            # Optional Slack message metadata (e.g. job-seeded tags), forwarded
+            # verbatim so apps can identify their own posts deterministically
+            # (conversations.history?include_all_metadata=true).
+            message_metadata = slack_meta.get("message_metadata") or None
             thread_ts = slack_meta.get("thread_ts")
             origin_chat_id = str((slack_meta.get("event", {}) or {}).get("channel") or msg.chat_id)
             client = self._get_client(origin_chat_id)
@@ -293,6 +297,8 @@ class SlackChannel(BaseChannel):
                                 thread_ts=thread_ts_param,
                                 blocks=[{"type": "markdown", "text": chunk}],
                             )
+                        if message_metadata:
+                            kwargs["metadata"] = message_metadata
                         await client.chat_postMessage(**kwargs)
 
             for media_path in msg.media or []:
