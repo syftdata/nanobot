@@ -56,6 +56,9 @@ class SlackConfig(Base):
 
 
 SLACK_MAX_MESSAGE_LEN = 39_000  # Slack API allows ~40k; leave margin
+# Block Kit `markdown` blocks cap at 12k chars per message (vs ~40k for plain
+# text) — split agent replies against this smaller budget.
+SLACK_MARKDOWN_BLOCK_LEN = 11_500
 SLACK_DOWNLOAD_TIMEOUT = 30.0
 _HTML_DOWNLOAD_PREFIXES = (b"<!doctype html", b"<html")
 
@@ -256,16 +259,41 @@ class SlackChannel(BaseChannel):
             if is_progress and not msg.content:
                 pass  # skip empty progress messages (e.g. tool-event-only updates)
             elif msg.content or not (msg.media or []):
-                mrkdwn = self._to_mrkdwn(msg.content) if msg.content else " "
+                raw = msg.content or " "
                 buttons = getattr(msg, "buttons", None) or []
-                chunks = split_message(mrkdwn, SLACK_MAX_MESSAGE_LEN)
-                for index, chunk in enumerate(chunks):
-                    kwargs: dict[str, Any] = dict(
-                        channel=target_chat_id, text=chunk, thread_ts=thread_ts_param,
+                if not raw.strip():
+                    # nothing renderable — keep the legacy plain-text ping
+                    await client.chat_postMessage(
+                        channel=target_chat_id, text=" ", thread_ts=thread_ts_param
                     )
-                    if buttons and index == len(chunks) - 1:
-                        kwargs["blocks"] = self._build_button_blocks(chunk, buttons)
-                    await client.chat_postMessage(**kwargs)
+                else:
+                    # Agent replies are standard Markdown. Deliver them via
+                    # Block Kit's `markdown` block so Slack renders the
+                    # Markdown natively (real links incl. mailto, true nested
+                    # lists) instead of converting to mrkdwn — the conversion
+                    # mangles pre-formatted links and fakes lists with glyphs.
+                    chunks = split_message(raw, SLACK_MARKDOWN_BLOCK_LEN)
+                    for index, chunk in enumerate(chunks):
+                        if buttons and index == len(chunks) - 1:
+                            # ask_user path: keep the legacy mrkdwn section —
+                            # buttons hang off it and expect mrkdwn text.
+                            mrkdwn = self._to_mrkdwn(chunk) or " "
+                            kwargs: dict[str, Any] = dict(
+                                channel=target_chat_id,
+                                text=mrkdwn,
+                                thread_ts=thread_ts_param,
+                                blocks=self._build_button_blocks(mrkdwn, buttons),
+                            )
+                        else:
+                            kwargs = dict(
+                                channel=target_chat_id,
+                                # plain-text fallback for notifications and
+                                # screen readers; rendering comes from the block
+                                text=chunk[:3000],
+                                thread_ts=thread_ts_param,
+                                blocks=[{"type": "markdown", "text": chunk}],
+                            )
+                        await client.chat_postMessage(**kwargs)
 
             for media_path in msg.media or []:
                 try:
