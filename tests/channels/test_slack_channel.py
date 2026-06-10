@@ -14,7 +14,12 @@ except ImportError:
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.slack import SLACK_MAX_MESSAGE_LEN, SlackChannel, SlackConfig
+from nanobot.channels.slack import (
+    SLACK_MARKDOWN_BLOCK_LEN,
+    SLACK_MAX_MESSAGE_LEN,
+    SlackChannel,
+    SlackConfig,
+)
 
 
 class _FakeAsyncWebClient:
@@ -197,16 +202,23 @@ async def test_send_splits_long_messages() -> None:
     fake_web = _FakeAsyncWebClient()
     channel._web_client = fake_web
 
+    content = "x" * (SLACK_MAX_MESSAGE_LEN + 10)
     await channel.send(
         OutboundMessage(
             channel="slack",
             chat_id="C123",
-            content="x" * (SLACK_MAX_MESSAGE_LEN + 10),
+            content=content,
         )
     )
 
-    assert len(fake_web.chat_post_calls) == 2
-    assert all(len(str(call["text"])) <= SLACK_MAX_MESSAGE_LEN for call in fake_web.chat_post_calls)
+    # Agent replies go out as Block Kit `markdown` blocks, which cap at
+    # SLACK_MARKDOWN_BLOCK_LEN per block, so a long reply spans several posts.
+    expected_chunks = -(-len(content) // SLACK_MARKDOWN_BLOCK_LEN)
+    assert len(fake_web.chat_post_calls) == expected_chunks
+    assert all(
+        len(call["blocks"][0]["text"]) <= SLACK_MARKDOWN_BLOCK_LEN
+        for call in fake_web.chat_post_calls
+    )
 
 
 @pytest.mark.asyncio
@@ -292,7 +304,12 @@ async def test_send_resolves_channel_name_to_channel_id() -> None:
     )
 
     assert fake_web.chat_post_calls == [
-        {"channel": "C999", "text": "hello", "thread_ts": None}
+        {
+            "channel": "C999",
+            "text": "hello",
+            "thread_ts": None,
+            "blocks": [{"type": "markdown", "text": "hello"}],
+        }
     ]
     assert len(fake_web.conversations_list_calls) == 1
 
@@ -326,7 +343,12 @@ async def test_send_resolves_user_handle_to_dm_channel() -> None:
 
     assert fake_web.conversations_open_calls == [{"users": "U234"}]
     assert fake_web.chat_post_calls == [
-        {"channel": "D234", "text": "hello", "thread_ts": None}
+        {
+            "channel": "D234",
+            "text": "hello",
+            "thread_ts": None,
+            "blocks": [{"type": "markdown", "text": "hello"}],
+        }
     ]
 
 
@@ -357,7 +379,12 @@ async def test_send_updates_reaction_on_origin_channel_for_cross_channel_send() 
     )
 
     assert fake_web.chat_post_calls == [
-        {"channel": "C999", "text": "done", "thread_ts": None}
+        {
+            "channel": "C999",
+            "text": "done",
+            "thread_ts": None,
+            "blocks": [{"type": "markdown", "text": "done"}],
+        }
     ]
     assert fake_web.reactions_remove_calls == [
         {"channel": "D_ORIGIN", "name": "eyes", "timestamp": "1700000000.000100"}
@@ -395,7 +422,12 @@ async def test_send_does_not_reuse_origin_thread_ts_for_cross_channel_send() -> 
     )
 
     assert fake_web.chat_post_calls == [
-        {"channel": "C999", "text": "done", "thread_ts": None}
+        {
+            "channel": "C999",
+            "text": "done",
+            "thread_ts": None,
+            "blocks": [{"type": "markdown", "text": "done"}],
+        }
     ]
 
 
