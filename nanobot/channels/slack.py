@@ -59,6 +59,10 @@ class SlackConfig(Base):
     # before responding (so it only replies to mentions in approved channels,
     # instead of every message). No effect for "mention"/"open" policies.
     group_require_mention: bool = False
+    # None = leave Slack's default unfurl behavior; set false to stop link/media
+    # preview cards under link-heavy bot posts (e.g. digests).
+    unfurl_links: bool | None = None
+    unfurl_media: bool | None = None
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
@@ -324,6 +328,10 @@ class SlackChannel(BaseChannel):
                             )
                         if message_metadata:
                             kwargs["metadata"] = message_metadata
+                        if self.config.unfurl_links is not None:
+                            kwargs["unfurl_links"] = self.config.unfurl_links
+                        if self.config.unfurl_media is not None:
+                            kwargs["unfurl_media"] = self.config.unfurl_media
                         await client.chat_postMessage(**kwargs)
 
             for media_path in msg.media or []:
