@@ -28,10 +28,13 @@ def build_bus_progress_callback(
         file_edit_events: list[dict[str, Any]] | None = None,
         reasoning: bool = False,
         reasoning_end: bool = False,
+        tool_hint_label: str | None = None,
     ) -> None:
         meta = dict(msg.metadata or {})
         meta["_progress"] = True
         meta["_tool_hint"] = tool_hint
+        if tool_hint_label:
+            meta["_tool_hint_label"] = tool_hint_label
         if reasoning:
             meta["_reasoning_delta"] = True
         if reasoning_end:
@@ -57,6 +60,7 @@ def build_bus_progress_callback(
         file_edit_events: list[dict[str, Any]] | None = None,
         reasoning: bool = False,
         reasoning_end: bool = False,
+        tool_hint_label: str | None = None,
     ) -> None:
         await _publish_progress(
             content,
@@ -65,6 +69,7 @@ def build_bus_progress_callback(
             file_edit_events=file_edit_events,
             reasoning=reasoning,
             reasoning_end=reasoning_end,
+            tool_hint_label=tool_hint_label,
         )
 
     return _bus_progress

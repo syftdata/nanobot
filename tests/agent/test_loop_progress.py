@@ -283,6 +283,63 @@ class TestToolEventProgress:
         assert finish["result"] == "file.txt"
 
     @pytest.mark.asyncio
+    async def test_bus_progress_forwards_tool_hint_label_to_outbound_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        """The humanized tool-hint label must reach OutboundMessage metadata so
+        channels (e.g. Slack typing status) can show it instead of the raw hint.
+
+        Regression: the bus progress callback previously dropped tool_hint_label,
+        making Slack fall back to raw hints like ``$ sqlite3 ...``.
+        """
+        from nanobot.config.schema import ChannelsConfig
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            model="test-model",
+            channels_config=ChannelsConfig(
+                tool_hint_labels={"query_entities": "Querying your data"},
+            ),
+        )
+
+        tool_call = ToolCallRequest(
+            id="tc1", name="query_entities", arguments={"q": "all accounts"}
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.prepare_call = MagicMock(return_value=(None, {"q": "all accounts"}, None))
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        msg = InboundMessage(
+            channel="slack",
+            sender_id="u1",
+            chat_id="chat1",
+            content="show accounts",
+        )
+        await loop._dispatch(msg)
+
+        outbound = []
+        while bus.outbound_size > 0:
+            outbound.append(await bus.consume_outbound())
+
+        labeled = [
+            m for m in outbound
+            if m.metadata and m.metadata.get("_tool_hint_label")
+        ]
+        assert labeled, "expected an outbound message carrying _tool_hint_label"
+        assert labeled[0].metadata["_tool_hint_label"] == "Querying your data"
+        assert labeled[0].metadata.get("_tool_hint") is True
+
+    @pytest.mark.asyncio
     async def test_bus_progress_forwards_file_edit_events_without_channel_branch(self, tmp_path: Path) -> None:
         bus = MessageBus()
         provider = MagicMock()
