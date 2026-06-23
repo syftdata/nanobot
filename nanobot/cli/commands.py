@@ -1189,9 +1189,11 @@ def _run_gateway(
         nonlocal shutdown_reason
 
         if hasattr(signal, "SIGHUP"):
+            from nanobot.agent.tools.mcp import request_mcp_reload
+
             asyncio.get_running_loop().add_signal_handler(
                 signal.SIGHUP,
-                lambda: asyncio.create_task(agent.reload_mcp()),
+                lambda: asyncio.create_task(request_mcp_reload(agent.bus)),
             )
         try:
             await cron.start()
