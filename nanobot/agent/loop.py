@@ -31,6 +31,7 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.utils.langfuse_turn import set_turn_output, turn_trace
 from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import (
@@ -815,7 +816,21 @@ class AgentLoop:
         ) if _goal_lines else SUSTAINED_GOAL_CONTINUE_PROMPT
         session_metadata = session.metadata if session is not None else None
         try:
-            result = await self.runner.run(AgentRunSpec(
+            # One Langfuse trace per turn (all LLM calls nested), threaded into a
+            # per-channel Session shared with the webapp's digest traces. No-op
+            # unless LANGFUSE_SECRET_KEY is set. Ambient OTel context — reaches
+            # the provider's wrapped client without threading kwargs through
+            # runner/provider layers. The span carries the user's message as the
+            # trace input; the final reply is attached below as its output.
+            with turn_trace(
+                channel=channel,
+                chat_id=chat_id,
+                session_key=active_session_key,
+                metadata=metadata,
+                workspace=self.workspace,
+                initial_messages=initial_messages,
+            ) as _lf_turn_span:
+                result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
                 tools=tools or self.tools,
                 model=self.model,
@@ -850,6 +865,7 @@ class AgentLoop:
                     message_metadata=metadata,
                 ),
             ))
+                set_turn_output(_lf_turn_span, result.final_content)
         finally:
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
