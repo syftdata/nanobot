@@ -747,3 +747,82 @@ def test_group_require_mention_accepts_camel_case_alias() -> None:
     )
     assert config.group_require_mention is True
     assert config.group_allow_from == ["C_OK"]
+
+
+def _mention_event(event_type: str, ts: str = "1700000000.000100") -> dict:
+    return {
+        "event": {
+            "type": event_type,
+            "user": "U1",
+            "channel": "C123",
+            "channel_type": "channel",
+            "text": "<@UBOT> what changed today?",
+            "ts": ts,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_mention_arriving_only_as_message_is_handled() -> None:
+    """Installs without `app_mentions:read` never get an app_mention copy."""
+    channel = SlackChannel(
+        SlackConfig(enabled=True, group_policy="mention", bot_token="xoxb-test"),
+        MessageBus(),
+    )
+    channel._bot_user_id = "UBOT"
+    channel._all_bot_user_ids = {"UBOT"}
+    channel._web_client = _FakeAsyncWebClient()
+    channel._with_thread_context = AsyncMock(return_value="what changed today?")  # type: ignore[method-assign]
+    channel._handle_message = AsyncMock()  # type: ignore[method-assign]
+
+    await channel._process_slack_event(_mention_event("message"))
+
+    channel._handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_mention_delivered_twice_is_handled_once() -> None:
+    """With `app_mentions:read` both copies arrive; only the first is answered."""
+    channel = SlackChannel(
+        SlackConfig(enabled=True, group_policy="mention", bot_token="xoxb-test"),
+        MessageBus(),
+    )
+    channel._bot_user_id = "UBOT"
+    channel._all_bot_user_ids = {"UBOT"}
+    channel._web_client = _FakeAsyncWebClient()
+    channel._with_thread_context = AsyncMock(return_value="what changed today?")  # type: ignore[method-assign]
+    channel._handle_message = AsyncMock()  # type: ignore[method-assign]
+
+    await channel._process_slack_event(_mention_event("message"))
+    await channel._process_slack_event(_mention_event("app_mention"))
+    # A Slack delivery retry of the same event is dropped too.
+    await channel._process_slack_event(_mention_event("message"))
+
+    channel._handle_message.assert_awaited_once()
+
+    # A genuinely new message (different ts) still gets through.
+    await channel._process_slack_event(_mention_event("message", ts="1700000000.000200"))
+    assert channel._handle_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_message_only_mention_tracks_the_thread() -> None:
+    """Follow-ups in the thread work without re-mentioning the bot."""
+    channel = SlackChannel(
+        SlackConfig(enabled=True, group_policy="mention", bot_token="xoxb-test"),
+        MessageBus(),
+    )
+    channel._bot_user_id = "UBOT"
+    channel._all_bot_user_ids = {"UBOT"}
+    channel._web_client = _FakeAsyncWebClient()
+    channel._with_thread_context = AsyncMock(return_value="what changed today?")  # type: ignore[method-assign]
+    channel._handle_message = AsyncMock()  # type: ignore[method-assign]
+
+    await channel._process_slack_event(_mention_event("message"))
+
+    assert (
+        channel._should_respond_in_channel(
+            "message", "and last week?", "C123", thread_ts="1700000000.000100"
+        )
+        is True
+    )
