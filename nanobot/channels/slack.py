@@ -108,6 +108,7 @@ class SlackChannel(BaseChannel):
         self._webhook_runner: Any | None = None
         self._mention_threads: OrderedDict[str, None] = OrderedDict()
         self._fetched_thread_contexts: OrderedDict[str, None] = OrderedDict()
+        self._handled_events: OrderedDict[str, None] = OrderedDict()
 
     def _get_client(self, channel_id: str | None = None) -> AsyncWebClient | None:
         """Get the appropriate Slack client for the given channel."""
@@ -517,8 +518,20 @@ class SlackChannel(BaseChannel):
             return
 
         text = event.get("text") or ""
-        if event_type == "message" and any(f"<@{bot_id}>" in text for bot_id in self._all_bot_user_ids):
-            return
+
+        # A mention can reach us twice — once as `message`, once as `app_mention`
+        # — but ONLY when the install granted `app_mentions:read`. Installs
+        # without that scope get the `message` copy alone, so dropping every
+        # mentioning `message` (the old guard here) made the bot mute in those
+        # workspaces. De-dup on the message identity instead — channel + ts is
+        # identical across both copies — so whichever copy lands first is
+        # handled and the other is skipped. This also absorbs Slack's delivery
+        # retries, which repeat the same event.
+        event_key = f"{chat_id}:{event.get('ts')}"
+        if event.get("ts") and chat_id:
+            if event_key in self._handled_events:
+                return
+            self._track_handled_event(event_key)
 
         # Debug: log basic event shape
         self.logger.debug(
@@ -552,7 +565,10 @@ class SlackChannel(BaseChannel):
         ):
             return
 
-        if event_type == "app_mention":
+        # Remember the thread so later replies in it don't need another mention.
+        # Keyed off the mention itself rather than the event type: on installs
+        # without `app_mentions:read` the mention only ever arrives as `message`.
+        if self._is_mention(event_type, text):
             thread_key = event_thread_ts or event.get("ts")
             if thread_key:
                 self._track_mention_thread(thread_key)
@@ -944,6 +960,16 @@ class SlackChannel(BaseChannel):
         return "channel"
 
     _MAX_MENTION_THREADS = 10_000
+    _MAX_HANDLED_EVENTS = 10_000
+
+    def _track_handled_event(self, event_key: str) -> None:
+        """Remember a message we've picked up, so its twin copy is ignored."""
+        if event_key in self._handled_events:
+            self._handled_events.move_to_end(event_key)
+        else:
+            self._handled_events[event_key] = None
+            if len(self._handled_events) > self._MAX_HANDLED_EVENTS:
+                self._handled_events.popitem(last=False)
 
     def _track_mention_thread(self, thread_key: str) -> None:
         if thread_key in self._mention_threads:
