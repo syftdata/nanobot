@@ -42,6 +42,15 @@ class TestGenerateCode:
         assert store.approve_code(code2) is None
 
 
+class TestFormatPairingReply:
+    def test_points_owner_to_webui_with_command_fallback(self) -> None:
+        reply = store.format_pairing_reply("ABCD-EFGH")
+
+        assert "nanobot WebUI" in reply
+        assert "ABCD-EFGH" in reply
+        assert "/pairing approve ABCD-EFGH" in reply
+
+
 class TestApproveDeny:
     def test_approve_moves_to_approved(self) -> None:
         code = store.generate_code("telegram", "123")
@@ -81,6 +90,21 @@ class TestRevoke:
 
     def test_revoke_unknown_returns_false(self) -> None:
         assert store.revoke("telegram", "999") is False
+
+    def test_clear_channel_removes_approved_and_pending(self) -> None:
+        code = store.generate_code("telegram", "123")
+        store.approve_code(code)
+        store.generate_code("telegram", "456")
+        store.generate_code("discord", "789")
+
+        assert store.clear_channel("telegram") == {"approved": 1, "pending": 1}
+
+        assert store.is_approved("telegram", "123") is False
+        pending = store.list_pending()
+        assert [item["channel"] for item in pending] == ["discord"]
+
+    def test_clear_channel_unknown_returns_zero_counts(self) -> None:
+        assert store.clear_channel("telegram") == {"approved": 0, "pending": 0}
 
 
 class TestListPending:
@@ -174,6 +198,39 @@ class TestHandlePairingCommand:
         assert "Pending pairing requests:" in reply
 
 
+class TestNonStringSenderId:
+    def test_numeric_sender_id_round_trip(self) -> None:
+        code = store.generate_code("telegram", 12345)
+        assert store.approve_code(code) == ("telegram", "12345")
+        assert store.is_approved("telegram", 12345) is True
+        assert store.is_approved("telegram", "12345") is True
+        assert store.get_approved("telegram") == ["12345"]
+        assert store.revoke("telegram", 12345) is True
+        assert store.is_approved("telegram", "12345") is False
+
+    def test_hand_edited_numeric_pending_does_not_corrupt_approved_set(self) -> None:
+        store._store_path().write_text(
+            '{"approved": {"telegram": ["111"]}, '
+            '"pending": {"ABCD-EFGH": {"channel": "telegram", "sender_id": 222, '
+            '"created_at": 1000.0, "expires_at": 9999999999.0}}}',
+            encoding="utf-8",
+        )
+        assert store.approve_code("ABCD-EFGH") == ("telegram", "222")
+        assert store.is_approved("telegram", 222) is True
+        store.generate_code("telegram", 333)
+        assert store.get_approved("telegram") == ["111", "222"]
+
+    def test_numeric_id_in_hand_edited_store(self) -> None:
+        store._store_path().write_text(
+            '{"approved": {"telegram": [12345]}, "pending": {}}',
+            encoding="utf-8",
+        )
+        assert store.is_approved("telegram", "12345") is True
+        assert store.is_approved("telegram", 12345) is True
+        assert store.revoke("telegram", 12345) is True
+        assert store.is_approved("telegram", "12345") is False
+
+
 class TestStoreDurability:
     def test_corruption_recovery(self, tmp_path, monkeypatch) -> None:
         path = tmp_path / "pairing.json"
@@ -183,3 +240,67 @@ class TestStoreDurability:
         # Should recover gracefully and act as empty store
         assert store.list_pending() == []
         assert store.is_approved("telegram", "123") is False
+
+
+def test_load_treats_null_approved_channel_list_as_empty(tmp_path, monkeypatch):
+    """Null approved channel lists must not crash pairing checks.
+
+    JSON stores can contain ``"telegram": null`` after partial edits; treat
+    that like an empty allow-list, matching corrupt-JSON reset behavior.
+    """
+    path = tmp_path / "pairing.json"
+    path.write_text(
+        '{"approved": {"telegram": null, "discord": ["456"]}, "pending": {}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(store, "_store_path", lambda: path)
+    assert store.is_approved("telegram", "123") is False
+    assert store.is_approved("discord", "456") is True
+    assert store.get_approved("telegram") == []
+
+
+def test_load_treats_null_approved_and_pending_maps_as_empty(tmp_path, monkeypatch):
+    """Top-level approved/pending null must not crash pairing load or list_pending."""
+    path = tmp_path / "pairing.json"
+    path.write_text(
+        '{"approved": null, "pending": null}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(store, "_store_path", lambda: path)
+    assert store.is_approved("telegram", "123") is False
+    assert store.list_pending() == []
+    assert store.get_approved("telegram") == []
+
+
+@pytest.mark.parametrize("payload", ["null", "[]", "true"])
+def test_load_treats_non_object_store_as_empty(tmp_path, monkeypatch, payload):
+    path = tmp_path / "pairing.json"
+    path.write_text(payload, encoding="utf-8")
+    monkeypatch.setattr(store, "_store_path", lambda: path)
+    assert store.list_pending() == []
+    assert store.is_approved("telegram", "123") is False
+
+
+def test_list_pending_skips_null_pending_entries(tmp_path, monkeypatch):
+    """Null pending entry values must be dropped instead of crashing list_pending."""
+    path = tmp_path / "pairing.json"
+    path.write_text(
+        '{"approved": {}, "pending": {"ABCD-EFGH": null}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(store, "_store_path", lambda: path)
+    assert store.list_pending() == []
+    assert store.clear_channel("telegram") == {"approved": 0, "pending": 0}
+
+
+def test_pending_gc_drops_malformed_entries(tmp_path, monkeypatch):
+    path = tmp_path / "pairing.json"
+    path.write_text(
+        '{"approved": {}, "pending": {'
+        '"bad-expiry": {"channel": "telegram", "sender_id": "123", "expires_at": null},'
+        '"missing-sender": {"channel": "telegram", "expires_at": 9999999999}'
+        "}}",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(store, "_store_path", lambda: path)
+    assert store.list_pending() == []

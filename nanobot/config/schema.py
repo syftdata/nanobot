@@ -2,26 +2,21 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
-from pydantic.alias_generators import to_camel
+from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
+from nanobot.config_base import Base
 from nanobot.cron.types import CronSchedule
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
+    from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
     from nanobot.agent.tools.self import MyToolConfig
     from nanobot.agent.tools.shell import ExecToolConfig
     from nanobot.agent.tools.web import WebToolsConfig
-
-
-class Base(BaseModel):
-    """Base model that accepts both camelCase and snake_case keys."""
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
 
 class ChannelsConfig(Base):
@@ -35,13 +30,12 @@ class ChannelsConfig(Base):
     model_config = ConfigDict(extra="allow")
 
     send_progress: bool = True  # stream agent's text progress to the channel
-    send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+    send_tool_hints: bool = True  # stream tool-call hints (e.g. read_file("…"))
     show_reasoning: bool = True  # surface model reasoning when channel implements it
-    extract_document_text: bool = True  # extract text from document attachments before sending to the model
+    extract_document_text: bool = True  # Deprecated and ignored; documents are read on demand
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
     transcription_provider: str = "groq"  # Deprecated: use top-level transcription.provider
     transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Deprecated: use top-level transcription.language
-    tool_hint_labels: dict[str, str] = Field(default_factory=dict)  # tool_name -> user-facing phrase (e.g. "Querying your data")
 
 
 class TranscriptionConfig(Base):
@@ -62,14 +56,14 @@ class DreamConfig(Base):
 
     enabled: bool = True  # Register the periodic Dream consolidation job on startup
     interval_h: int = Field(default=2, ge=1)  # Every 2 hours by default
-    cron: str | None = Field(default=None, exclude=True)  # Legacy cron expression override
+    cron: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )  # Legacy cron expression override
     model_override: str | None = Field(
         default=None,
         validation_alias=AliasChoices("modelOverride", "model", "model_override"),
-    )  # Override model for Dream sessions (pending implementation)
-    max_batch_size: int = Field(default=20, ge=1)  # Deprecated: no longer used
-    max_iterations: int = Field(default=15, ge=1)  # Deprecated: no longer used
-    annotate_line_ages: bool = True  # Deprecated: no longer used
+    )  # Model preset name for Dream sessions
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""
@@ -106,7 +100,7 @@ class ModelPresetConfig(Base):
     model: str
     provider: str = "auto"
     max_tokens: int = 8192
-    context_window_tokens: int = 65_536
+    context_window_tokens: int = 200_000
     temperature: float = 0.1
     reasoning_effort: str | None = None
 
@@ -129,12 +123,13 @@ class AgentDefaults(Base):
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
     max_tokens: int = 8192
-    context_window_tokens: int = 65_536
+    context_window_tokens: int = 200_000
     context_block_limit: int | None = None
     temperature: float = 0.1
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
     max_concurrent_subagents: int = Field(default=1, ge=1)
+    fail_on_tool_error: bool = True
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     tool_hint_max_length: int = Field(
@@ -151,15 +146,15 @@ class AgentDefaults(Base):
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
     session_ttl_minutes: int = Field(
-        default=0,
+        default=15,
         ge=0,
         validation_alias=AliasChoices("idleCompactAfterMinutes", "sessionTtlMinutes"),
         serialization_alias="idleCompactAfterMinutes",
     )  # Auto-compact idle threshold in minutes (0 = disabled)
-    max_messages: int = Field(
-        default=120,
+    idle_compact_check_interval_seconds: int = Field(
+        default=60,
         ge=0,
-    )  # Max messages to replay from session history (0 = use default 120, respects token budget)
+    )  # Minimum interval in seconds between scans for idle sessions
     consolidation_ratio: float = Field(
         default=0.5,
         ge=0.1,
@@ -168,6 +163,17 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError:
+            raise ValueError(f"unknown timezone {value!r}") from None
+        return value
 
 
 class AgentsConfig(Base):
@@ -179,12 +185,41 @@ class AgentsConfig(Base):
 class ProviderConfig(Base):
     """LLM provider configuration."""
 
+    # User-facing name for dynamic custom providers.
+    display_name: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     api_key: str | None = Field(default=None, repr=False)
     api_base: str | None = None
     api_type: Literal["auto", "chat_completions", "responses"] = "auto"  # Request API surface
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
     extra_body: dict[str, Any] | None = None  # Extra provider request fields; shape depends on provider/API surface
     extra_query: dict[str, str] | None = None  # Extra query params (e.g. api-version for Azure-style gateways)
+    proxy: str | None = None  # Explicit HTTP proxy; image downloads trust its DNS and egress
+    thinking_style: str | None = None  # Thinking/reasoning style for custom providers
+
+    # Valid values mirror the keys of _THINKING_STYLE_MAP in
+    # nanobot/providers/openai_compat_provider.py. Kept duplicated here to
+    # avoid an import cycle (schema.py must not import from providers/).
+    _VALID_THINKING_STYLES: ClassVar[tuple[str, ...]] = (
+        "thinking_type",
+        "enable_thinking",
+        "reasoning_split",
+    )
+
+    @field_validator("thinking_style")
+    @classmethod
+    def _validate_thinking_style(cls, v: str | None) -> str | None:
+        if not v:  # None or "" -> no injection, valid (backwards compatible)
+            return v
+        if v not in cls._VALID_THINKING_STYLES:
+            raise ValueError(
+                f"Invalid thinking_style {v!r}. "
+                f"Must be one of: {', '.join(repr(s) for s in cls._VALID_THINKING_STYLES)} "
+                f"(or empty/omitted)."
+            )
+        return v
 
 
 class BedrockProviderConfig(ProviderConfig):
@@ -216,6 +251,7 @@ class ProvidersConfig(Base):
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)
+    modelscope: ProviderConfig = Field(default_factory=ProviderConfig)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
     lm_studio: ProviderConfig = Field(default_factory=ProviderConfig)  # LM Studio local models
@@ -223,6 +259,7 @@ class ProvidersConfig(Base):
     ovms: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenVINO Model Server (OVMS)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
+    kimi_coding: ProviderConfig = Field(default_factory=ProviderConfig)  # Kimi Coding Plan (Anthropic Messages API)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax_anthropic: ProviderConfig = Field(default_factory=ProviderConfig)  # MiniMax Anthropic endpoint (thinking)
     mistral: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -238,9 +275,13 @@ class ProvidersConfig(Base):
     byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
+    xai_grok: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # xAI Grok (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
     nvidia: ProviderConfig = Field(default_factory=ProviderConfig)  # NVIDIA NIM (nvapi- keys)
+    opencode: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenCode Zen (canonical provider id)
+    opencode_zen: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenCode Zen (curated coding models)
+    opencode_go: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenCode Go (low-cost coding models)
 
     @model_validator(mode="after")
     def convert_extra_providers(self):
@@ -286,6 +327,18 @@ class ApiConfig(Base):
     host: str = "127.0.0.1"  # Safer default: local-only bind.
     port: int = 8900
     timeout: float = 600.0  # Per-request timeout in seconds.
+    api_key: str = Field(default="", repr=False)
+
+    @model_validator(mode="after")
+    def wildcard_host_requires_auth(self) -> "ApiConfig":
+        if self.host not in ("0.0.0.0", "::"):
+            return self
+        if self.api_key.strip():
+            return self
+        raise ValueError(
+            "host is 0.0.0.0 (all interfaces) but api_key is not set "
+            "- set api.api_key to prevent unauthenticated access"
+        )
 
 
 class GatewayConfig(Base):
@@ -293,6 +346,7 @@ class GatewayConfig(Base):
 
     host: str = "127.0.0.1"  # Safer default: local-only bind.
     port: int = 18790
+    restart_mode: Literal["auto", "exec", "spawn", "exit"] = "auto"
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
@@ -307,7 +361,7 @@ class MCPServerConfig(Base):
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
-    enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
+    enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all capabilities (tools, resources, prompts); any restriction = only listed tools, no resources/prompts
 
 
 def _lazy_default(module_path: str, class_name: str) -> Any:
@@ -321,12 +375,13 @@ class ToolsConfig(Base):
     """Tools configuration.
 
     Field types for tool-specific sub-configs are resolved via model_rebuild()
-    at the bottom of this file to avoid circular imports (tool modules import
-    Base from schema.py).
+    at the bottom of this file so tool config classes can stay next to their
+    tool implementations.
     """
 
     web: WebToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.web", "WebToolsConfig"))
     exec: ExecToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.shell", "ExecToolConfig"))
+    file: FileToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.filesystem", "FileToolsConfig"))
     cli_apps: CliAppsToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.cli_apps", "CliAppsToolConfig"))
     my: MyToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.self", "MyToolConfig"))
     image_generation: ImageGenerationToolConfig = Field(
@@ -342,6 +397,13 @@ class ToolsConfig(Base):
             "allow_local_preview_access",
         ),
     )  # allow WebUI Full Access shell checks against localhost services; legacy allowLocalPreviewAccess still reads
+    webui_allow_remote_package_install: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "webuiAllowRemotePackageInstall",
+            "webui_allow_remote_package_install",
+        ),
+    )  # allow non-local WebUI clients to install optional Python packages
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
@@ -359,6 +421,7 @@ class Config(BaseSettings):
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),
+        serialization_alias="modelPresets",
     )
 
     def __init__(self, **values: Any) -> None:
@@ -373,6 +436,9 @@ class Config(BaseSettings):
         name = self.agents.defaults.model_preset
         if name and name != "default" and name not in self.model_presets:
             raise ValueError(f"model_preset {name!r} not found in model_presets")
+        dream_name = self.agents.defaults.dream.model_override
+        if dream_name and dream_name != "default" and dream_name not in self.model_presets:
+            raise ValueError(f"Dream model preset {dream_name!r} not found in model_presets")
         for fallback in self.agents.defaults.fallback_models:
             if isinstance(fallback, str) and fallback not in self.model_presets:
                 raise ValueError(f"fallback_models entry {fallback!r} not found in model_presets")
@@ -565,6 +631,7 @@ def _resolve_tool_config_refs() -> None:
     import sys
 
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
+    from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
     from nanobot.agent.tools.self import MyToolConfig
     from nanobot.agent.tools.shell import ExecToolConfig
@@ -573,6 +640,7 @@ def _resolve_tool_config_refs() -> None:
     # Re-export into this module's namespace
     mod = sys.modules[__name__]
     mod.ExecToolConfig = ExecToolConfig  # type: ignore[attr-defined]
+    mod.FileToolsConfig = FileToolsConfig  # type: ignore[attr-defined]
     mod.CliAppsToolConfig = CliAppsToolConfig  # type: ignore[attr-defined]
     mod.WebToolsConfig = WebToolsConfig  # type: ignore[attr-defined]
     mod.WebSearchConfig = WebSearchConfig  # type: ignore[attr-defined]

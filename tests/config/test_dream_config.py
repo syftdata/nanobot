@@ -29,12 +29,18 @@ def test_dream_config_honors_legacy_cron_override() -> None:
     assert cfg.describe_schedule() == "cron 0 */4 * * * (legacy)"
 
 
-def test_dream_config_dump_uses_interval_h_and_hides_legacy_cron() -> None:
+def test_dream_config_dump_preserves_legacy_cron_override() -> None:
     cfg = DreamConfig.model_validate({"intervalH": 5, "cron": "0 */4 * * *"})
 
     dumped = cfg.model_dump(by_alias=True)
 
     assert dumped["intervalH"] == 5
+    assert dumped["cron"] == "0 */4 * * *"
+
+
+def test_dream_config_dump_omits_empty_legacy_cron() -> None:
+    dumped = DreamConfig().model_dump(by_alias=True)
+
     assert "cron" not in dumped
 
 
@@ -46,3 +52,22 @@ def test_dream_config_uses_model_override_name_and_accepts_legacy_model() -> Non
     assert cfg.model_override == "openrouter/sonnet"
     assert dumped["modelOverride"] == "openrouter/sonnet"
     assert "model" not in dumped
+
+
+def test_dream_config_ignores_retired_noop_fields() -> None:
+    cfg = DreamConfig.model_validate(
+        {
+            "maxBatchSize": 99,
+            "maxIterations": 99,
+            "annotateLineAges": False,
+        }
+    )
+
+    dumped = cfg.model_dump(by_alias=True)
+
+    assert not hasattr(cfg, "max_batch_size")
+    assert not hasattr(cfg, "max_iterations")
+    assert not hasattr(cfg, "annotate_line_ages")
+    assert "maxBatchSize" not in dumped
+    assert "maxIterations" not in dumped
+    assert "annotateLineAges" not in dumped

@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import difflib
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.tools.base import tool_parameters
+from nanobot.agent.tools.base import ToolResult, tool_parameters
 from nanobot.agent.tools.filesystem import _FsTool
 from nanobot.agent.tools.schema import (
     ArraySchema,
@@ -31,26 +30,13 @@ class _PatchError(ValueError):
     pass
 
 
-_ABSOLUTE_WINDOWS_RE = re.compile(r"^[A-Za-z]:[\\/]")
-
-
-def _validate_relative_path(path: str) -> str:
+def _validate_patch_path(path: str) -> str:
     normalized = path.strip()
     if not normalized:
         raise _PatchError("patch path cannot be empty")
     if "\0" in normalized:
         raise _PatchError(f"patch path contains a null byte: {path!r}")
-    if normalized.startswith(("~", "/", "\\")) or _ABSOLUTE_WINDOWS_RE.match(normalized):
-        raise _PatchError(f"patch path must be relative: {path}")
-    if any(part == ".." for part in re.split(r"[\\/]+", normalized)):
-        raise _PatchError(f"patch path must not contain '..': {path}")
     return normalized
-
-
-def _lines_to_text(lines: list[str]) -> str:
-    if not lines:
-        return ""
-    return "\n".join(lines) + "\n"
 
 
 def _text_line_count(text: str) -> int:
@@ -98,7 +84,10 @@ def _format_summary(summary: _PatchSummary) -> str:
     tool_parameters_schema(
         edits=ArraySchema(
             items=ObjectSchema(
-                path=StringSchema("Relative path to the file to edit."),
+                path=StringSchema(
+                    "Path to the file to edit. Relative paths resolve against the "
+                    "workspace; absolute paths and '..' obey the workspace access policy."
+                ),
                 action=StringSchema(
                     "Operation type: replace or add.",
                     enum=["replace", "add"],
@@ -138,7 +127,8 @@ class ApplyPatchTool(_FsTool):
             "Default tool for code edits. Supports multi-file changes in a single call. "
             "Provide a list of structured edits, each specifying a file path, action "
             "(replace/add), and the exact text to change. "
-            "Paths must be relative. Set dry_run=true to validate and preview without writing files. "
+            "Paths are resolved by the current workspace access policy. "
+            "Set dry_run=true to validate and preview without writing files. "
             "Use edit_file only for small exact replacements on a single file."
         )
 
@@ -161,11 +151,11 @@ class ApplyPatchTool(_FsTool):
                 raw_path = edit.get("path")
                 if not isinstance(raw_path, str):
                     raise _PatchError("path required for edit")
-                path = _validate_relative_path(raw_path)
+                path = _validate_patch_path(raw_path)
                 action = edit.get("action")
                 if not isinstance(action, str):
                     raise _PatchError(f"action required for edit: {path}")
-                source = self._resolve(path)
+                source = self._resolve_write(path)
 
                 if action == "add":
                     new_text = edit.get("new_text")
@@ -293,8 +283,8 @@ class ApplyPatchTool(_FsTool):
                 _format_summary(summary) for summary in summaries
             )
         except PermissionError as exc:
-            return f"Error: {exc}"
+            return ToolResult.error(f"Error: {exc}")
         except _PatchError as exc:
-            return f"Error applying patch: {exc}"
+            return ToolResult.error(f"Error applying patch: {exc}")
         except Exception as exc:
-            return f"Error applying patch: {exc}"
+            return ToolResult.error(f"Error applying patch: {exc}")

@@ -173,26 +173,39 @@ MCP_PRESETS: tuple[McpPreset, ...] = (
         category="web",
         description="Scrape, crawl, search, and extract web pages through Firecrawl's MCP server.",
         docs_url="https://docs.firecrawl.dev/use-cases/developers-mcp",
-        transport="stdio",
+        transport="streamableHttp",
         install_supported=True,
         brand_domain="firecrawl.dev",
         brand_color="#EB5E28",
-        requires="Node.js, npx, and Firecrawl API key",
+        requires="Network access",
         server=MCPServerConfig(
-            type="stdio",
-            command="npx",
-            args=["-y", "firecrawl-mcp"],
+            type="streamableHttp",
+            url="https://mcp.firecrawl.dev/v2/mcp",
             tool_timeout=60,
         ),
-        fields=(
-            McpPresetField(
-                name="firecrawl_api_key",
-                label="Firecrawl API key",
-                target=("env", "FIRECRAWL_API_KEY"),
-                env_var="FIRECRAWL_API_KEY",
-                placeholder="fc-...",
-            ),
+        note=(
+            "Uses Firecrawl Keyless through the hosted MCP endpoint. No API key is required for "
+            "the built-in preset; use a custom MCP server URL if you want account-specific limits."
         ),
+    ),
+    McpPreset(
+        name="parallel-search",
+        display_name="Parallel Search",
+        category="web",
+        description="Search the web and fetch relevant page content through Parallel's hosted MCP server.",
+        docs_url="https://docs.parallel.ai/integrations/mcp/search-mcp",
+        transport="streamableHttp",
+        install_supported=True,
+        brand_domain="parallel.ai",
+        brand_color="#111827",
+        requires="Network access",
+        server=MCPServerConfig(
+            type="streamableHttp",
+            url="https://search.parallel.ai/mcp",
+            tool_timeout=60,
+            enabled_tools=["web_search", "web_fetch"],
+        ),
+        note="Free anonymous access for light use; no API key is required.",
     ),
     McpPreset(
         name="exa",

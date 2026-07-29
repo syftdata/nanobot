@@ -1,36 +1,48 @@
 """Session management for conversation history."""
 
+import base64
+import errno
 import json
 import os
 import re
-import shutil
+from collections import OrderedDict
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from weakref import WeakValueDictionary
 
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
+from nanobot.runtime_context import (
+    RUNTIME_CONTEXT_HISTORY_META,
+    public_history_message,
+)
 from nanobot.utils.helpers import (
     ensure_dir,
     estimate_message_tokens,
     find_legal_message_start,
     image_placeholder_text,
+    recent_message_start_index,
     safe_filename,
     strip_think,
 )
 from nanobot.utils.subagent_channel_display import scrub_subagent_announce_body
 
 FILE_MAX_MESSAGES = 2000
+SESSION_CACHE_MAX_SIZE = 128
+MIN_REPLAY_MAX_MESSAGES = 120
+REPLAY_TOKENS_PER_MESSAGE = 100
 _MESSAGE_TIME_PREFIX_RE = re.compile(r"^\[Message Time: [^\]]+\]\n?")
 _LOCAL_IMAGE_BREADCRUMB_RE = re.compile(r"^\[image: (?:/|~)[^\]]+\]\s*$")
 _TOOL_CALL_ECHO_RE = re.compile(r'^\s*(?:generate_image|message)\([^)]*\)\s*$')
 _SESSION_PREVIEW_MAX_CHARS = 120
 _SESSION_LIST_PREVIEW_MAX_RECORDS = 200
 _SESSION_LIST_PREVIEW_MAX_CHARS = 1_000_000
+_SESSION_DATA_ERRORS = (ValueError, TypeError, AttributeError, KeyError)
 _FORK_VOLATILE_METADATA_KEYS = {
     "goal_state",
     "pending_user_turn",
@@ -39,6 +51,15 @@ _FORK_VOLATILE_METADATA_KEYS = {
     "title",
     "title_user_edited",
 }
+
+
+def replay_max_messages_for_context(context_window_tokens: int | None) -> int:
+    if not context_window_tokens or context_window_tokens <= 0:
+        return FILE_MAX_MESSAGES
+    return min(
+        FILE_MAX_MESSAGES,
+        max(MIN_REPLAY_MAX_MESSAGES, context_window_tokens // REPLAY_TOKENS_PER_MESSAGE),
+    )
 
 
 def _sanitize_assistant_replay_text(content: str) -> str:
@@ -80,6 +101,7 @@ def _text_preview(content: Any) -> str:
 
 def _message_preview_text(message: dict[str, Any]) -> str:
     """Session list preview text; subagent inject blobs are shortened for display."""
+    message = public_history_message(message)
     content: Any = message.get("content")
     if message.get("injected_event") == "subagent_result" and isinstance(content, str):
         content = scrub_subagent_announce_body(content)
@@ -98,6 +120,12 @@ def _metadata_title(metadata: Any) -> str:
 
 
 @dataclass
+class RetentionResult:
+    dropped: list[dict]
+    already_consolidated_count: int
+
+
+@dataclass
 class Session:
     """A conversation session."""
 
@@ -109,6 +137,8 @@ class Session:
     last_consolidated: int = 0  # Number of messages already consolidated to files
 
     def __post_init__(self) -> None:
+        if not isinstance(self.metadata, dict):
+            self.metadata = {}
         # An out-of-range offset (corrupt metadata) would hide all history; reset it.
         if (
             isinstance(self.last_consolidated, bool)
@@ -116,25 +146,6 @@ class Session:
             or not 0 <= self.last_consolidated <= len(self.messages)
         ):
             self.last_consolidated = 0
-
-    @staticmethod
-    def _annotate_message_time(message: dict[str, Any], content: Any) -> Any:
-        """Expose persisted turn timestamps to the model for relative-date reasoning.
-
-        Annotating *every* assistant turn trains the model (via in-context
-        demonstrations) to start its own replies with the same
-        ``[Message Time: ...]`` prefix, which leaks metadata back to the user.
-        We therefore only annotate user turns. User-side stamps are enough to
-        pin adjacent assistant replies for relative-time reasoning, including
-        proactive messages the user replies to later.
-        """
-        timestamp = message.get("timestamp")
-        if not timestamp or not isinstance(content, str):
-            return content
-        role = message.get("role")
-        if role != "user":
-            return content
-        return f"[Message Time: {timestamp}]\n{content}"
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -149,10 +160,11 @@ class Session:
 
     def get_history(
         self,
-        max_messages: int = 120,
+        max_messages: int = FILE_MAX_MESSAGES,
         *,
         max_tokens: int = 0,
-        include_timestamps: bool = False,
+        extend_to_user: bool = False,
+        include_runtime_context: bool = True,
     ) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input.
 
@@ -160,8 +172,13 @@ class Session:
         token budget from the tail (``max_tokens``) when provided.
         """
         unconsolidated = self.messages[self.last_consolidated:]
-        max_messages = max_messages if max_messages > 0 else 120
-        sliced = unconsolidated[-max_messages:]
+        max_messages = max_messages if max_messages > 0 else FILE_MAX_MESSAGES
+        start_idx = recent_message_start_index(
+            unconsolidated,
+            max_messages,
+            extend_to_user=extend_to_user,
+        )
+        sliced = unconsolidated[start_idx:]
 
         # Avoid starting mid-turn when possible, except for proactive
         # assistant deliveries that the user may be replying to.
@@ -182,6 +199,12 @@ class Session:
         for message in sliced:
             if message.get("_command"):
                 continue
+            has_persisted_runtime_context = isinstance(
+                message.get(RUNTIME_CONTEXT_HISTORY_META),
+                dict,
+            )
+            if not include_runtime_context:
+                message = public_history_message(message)
             content = message.get("content", "")
             role = message.get("role")
             if role == "assistant" and isinstance(content, str):
@@ -198,7 +221,14 @@ class Session:
                 )
                 content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
             cli_apps = message.get("cli_apps")
-            if role == "user" and isinstance(cli_apps, list) and cli_apps and isinstance(content, str):
+            if (
+                include_runtime_context
+                and not has_persisted_runtime_context
+                and role == "user"
+                and isinstance(cli_apps, list)
+                and cli_apps
+                and isinstance(content, str)
+            ):
                 cli_lines: list[str] = []
                 for item in cli_apps[:8]:
                     if not isinstance(item, dict):
@@ -214,30 +244,6 @@ class Session:
                 if cli_lines:
                     breadcrumbs = "\n".join(cli_lines)
                     content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
-            mcp_presets = message.get("mcp_presets")
-            if (
-                role == "user"
-                and isinstance(mcp_presets, list)
-                and mcp_presets
-                and isinstance(content, str)
-            ):
-                mcp_lines: list[str] = []
-                for item in mcp_presets[:8]:
-                    if not isinstance(item, dict):
-                        continue
-                    name = str(item.get("name") or "").strip().lower()
-                    if not name:
-                        continue
-                    transport = str(item.get("transport") or "mcp").strip() or "mcp"
-                    mcp_lines.append(
-                        f"[MCP Preset Attachment: @{name}; tool_prefix=mcp_{name}_; "
-                        f"transport={transport}]"
-                    )
-                if mcp_lines:
-                    breadcrumbs = "\n".join(mcp_lines)
-                    content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
-            if include_timestamps:
-                content = self._annotate_message_time(message, content)
             if role == "assistant" and isinstance(content, str) and not content.strip():
                 if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
                     continue
@@ -287,50 +293,66 @@ class Session:
         self.updated_at = datetime.now()
         self.metadata.pop("_last_summary", None)
 
-    def retain_recent_legal_suffix(self, max_messages: int) -> tuple[list[dict], int]:
-        """Keep a legal recent suffix constrained by a hard message cap.
+    def retain_recent_legal_suffix(
+        self,
+        max_messages: int,
+        *,
+        extend_to_user: bool = False,
+    ) -> RetentionResult:
+        """Keep a legal recent suffix, optionally extending it back to a user turn.
 
-        Returns ``(dropped, already_consolidated_count)`` where *dropped* is
-        the list of removed messages (in original order) and
-        *already_consolidated_count* is how many of those were inside the
-        pre-existing ``last_consolidated`` prefix and therefore do not need
-        raw archiving.
+        Returns a RetentionResult with dropped messages and how many of those
+        were in the already-consolidated prefix. This method mutates
+        self.messages and self.last_consolidated in place.
         """
         if max_messages <= 0:
             dropped = list(self.messages)
             lc = self.last_consolidated
             self.clear()
-            return dropped, min(lc, len(dropped))
+            return RetentionResult(
+                dropped=dropped,
+                already_consolidated_count=min(lc, len(dropped)),
+            )
         if len(self.messages) <= max_messages:
-            return [], 0
+            return RetentionResult(
+                dropped=[],
+                already_consolidated_count=0,
+            )
 
         original = list(self.messages)
         before_lc = self.last_consolidated
 
-        retained = list(self.messages[-max_messages:])
+        start_idx = max(0, len(self.messages) - max_messages)
+        if extend_to_user:
+            start_idx = next(
+                (i for i in range(start_idx, -1, -1) if self.messages[i].get("role") == "user"),
+                start_idx,
+            )
 
-        # Prefer starting at a user turn when one exists within the tail.
+        retained = self.messages[start_idx:]
+
+        # Prefer starting at a user turn when one exists within the retained window.
         first_user = next((i for i, m in enumerate(retained) if m.get("role") == "user"), None)
         if first_user is not None:
             retained = retained[first_user:]
-        else:
-            # If the tail is assistant/tool-only, anchor to the latest user in
-            # the full session and take a capped forward window from there.
+        elif not extend_to_user:
+            # If the hard-capped tail is assistant/tool-only, anchor to the
+            # latest user in the full session and take a capped forward window.
             latest_user = next(
                 (i for i in range(len(self.messages) - 1, -1, -1)
                  if self.messages[i].get("role") == "user"),
                 None,
             )
             if latest_user is not None:
-                retained = list(self.messages[latest_user: latest_user + max_messages])
+                retained = self.messages[latest_user: latest_user + max_messages]
 
         # Mirror get_history(): avoid persisting orphan tool results at the front.
         start = find_legal_message_start(retained)
         if start:
             retained = retained[start:]
 
-        # Hard-cap guarantee: never keep more than max_messages.
-        if len(retained) > max_messages:
+        # Hard-cap guarantee unless the caller requested user-turn extension.
+        if not extend_to_user and len(retained) > max_messages:
             retained = retained[-max_messages:]
             start = find_legal_message_start(retained)
             if start:
@@ -361,7 +383,10 @@ class Session:
         self.messages = retained
         self.last_consolidated = new_lc
         self.updated_at = datetime.now()
-        return dropped, already_consolidated
+        return RetentionResult(
+            dropped=dropped,
+            already_consolidated_count=already_consolidated,
+        )
 
     def enforce_file_cap(
         self,
@@ -372,17 +397,17 @@ class Session:
         if limit <= 0 or len(self.messages) <= limit:
             return
 
-        dropped, already_consolidated = self.retain_recent_legal_suffix(limit)
-        if not dropped:
+        result = self.retain_recent_legal_suffix(limit)
+        if not result.dropped:
             return
 
-        archive_chunk = dropped[already_consolidated:]
+        archive_chunk = result.dropped[result.already_consolidated_count:]
         if archive_chunk and on_archive:
             on_archive(archive_chunk)
         logger.info(
             "Session file cap hit for {}: dropped {}, raw-archived {}, kept {}",
             self.key,
-            len(dropped),
+            len(result.dropped),
             len(archive_chunk),
             len(self.messages),
         )
@@ -399,16 +424,73 @@ class SessionManager:
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
-        self._cache: dict[str, Session] = {}
+        self._cache: OrderedDict[str, Session] = OrderedDict()
+        # Preserve identity for sessions held by active callers without retaining idle ones.
+        self._overflow_cache: WeakValueDictionary[str, Session] = WeakValueDictionary()
+        self._max_cached_sessions = SESSION_CACHE_MAX_SIZE
+        self._file_cap_archiver: Callable[..., None] | None = None
+
+    def _remember(self, session: Session) -> None:
+        """Keep recent sessions strongly cached without duplicating live objects."""
+        self._overflow_cache.pop(session.key, None)
+        self._cache[session.key] = session
+        self._cache.move_to_end(session.key)
+        while len(self._cache) > self._max_cached_sessions:
+            key, evicted = self._cache.popitem(last=False)
+            self._overflow_cache[key] = evicted
+
+    def _cached(self, key: str) -> Session | None:
+        session = self._cache.get(key)
+        if session is not None:
+            self._cache.move_to_end(key)
+            return session
+
+        session = self._overflow_cache.get(key)
+        if session is not None:
+            self._remember(session)
+        return session
+
+    def set_file_cap_archiver(self, archiver: Callable[..., None]) -> None:
+        """Archive unconsolidated overflow whenever a session is persisted."""
+        self._file_cap_archiver = archiver
 
     @staticmethod
     def safe_key(key: str) -> str:
         """Public helper used by HTTP handlers to map an arbitrary key to a stable filename stem."""
         return safe_filename(key.replace(":", "_"))
 
+    @staticmethod
+    def _storage_key(key: str) -> str:
+        """Collision-resistant encoding for internal session storage filenames."""
+        return base64.urlsafe_b64encode(key.encode()).decode().rstrip("=")
+
+    @staticmethod
+    def _decode_storage_key(stem: str) -> str | None:
+        """Reverse _storage_key(): decode a base64url (no-padding) stem back to the original key."""
+        try:
+            # Restore padding stripped by rstrip("=")
+            padding = 4 - len(stem) % 4
+            if padding != 4:
+                stem += "=" * padding
+            return base64.urlsafe_b64decode(stem).decode("utf-8")
+        except _SESSION_DATA_ERRORS:
+            return None
+
+    @classmethod
+    def _session_key_from_path(cls, path: Path) -> str | None:
+        """Decode a session key only from a canonical collision-resistant filename."""
+        key = cls._decode_storage_key(path.stem)
+        if key is None or cls._storage_key(key) != path.stem:
+            return None
+        return key
+
     def _get_session_path(self, key: str) -> Path:
-        """Get the file path for a session."""
-        return self.sessions_dir / f"{self.safe_key(key)}.jsonl"
+        """Get the collision-resistant workspace path for a session."""
+        return self.sessions_dir / f"{self._storage_key(key)}.jsonl"
+
+    def _get_legacy_lossy_path(self, key: str) -> Path:
+        """Previous workspace session path using lossy ':' to '_' replacement."""
+        return self.sessions_dir / f"{safe_filename(key.replace(':', '_'))}.jsonl"
 
     def _get_legacy_session_path(self, key: str) -> Path:
         """Legacy global session path (~/.nanobot/sessions/)."""
@@ -424,28 +506,20 @@ class SessionManager:
         Returns:
             The session.
         """
-        if key in self._cache:
-            return self._cache[key]
+        session = self._cached(key)
+        if session is not None:
+            return session
 
         session = self._load(key)
         if session is None:
             session = Session(key=key)
 
-        self._cache[key] = session
+        self._remember(session)
         return session
 
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
-        if not path.exists():
-            legacy_path = self._get_legacy_session_path(key)
-            if legacy_path.exists():
-                try:
-                    shutil.move(str(legacy_path), str(path))
-                    logger.info("Migrated session {} from legacy path", key)
-                except Exception:
-                    logger.exception("Failed to migrate session {}", key)
-
         if not path.exists():
             return None
 
@@ -463,6 +537,8 @@ class SessionManager:
                         continue
 
                     data = json.loads(line)
+                    if not isinstance(data, dict):
+                        raise ValueError("session records must be JSON objects")
 
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
@@ -480,16 +556,17 @@ class SessionManager:
                 metadata=metadata,
                 last_consolidated=last_consolidated
             )
-        except Exception as e:
+        except _SESSION_DATA_ERRORS as e:
             logger.warning("Failed to load session {}: {}", key, e)
             repaired = self._repair(key)
             if repaired is not None:
                 logger.info("Recovered session {} from corrupt file ({} messages)", key, len(repaired.messages))
             return repaired
 
-    def _repair(self, key: str) -> Session | None:
+    def _repair(self, key: str, *, path: Path | None = None) -> Session | None:
         """Attempt to recover a session from a corrupt JSONL file."""
-        path = self._get_session_path(key)
+        if path is None:
+            path = self._get_session_path(key)
         if not path.exists():
             return None
 
@@ -509,6 +586,9 @@ class SessionManager:
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError:
+                        skipped += 1
+                        continue
+                    if not isinstance(data, dict):
                         skipped += 1
                         continue
 
@@ -538,7 +618,7 @@ class SessionManager:
                 metadata=metadata,
                 last_consolidated=last_consolidated
             )
-        except Exception as e:
+        except _SESSION_DATA_ERRORS as e:
             logger.warning("Repair failed for session {}: {}", key, e)
             return None
 
@@ -562,6 +642,14 @@ class SessionManager:
         write-back caching (e.g. rclone VFS, NFS, FUSE mounts) do not lose
         the most recent writes.
         """
+        if self._file_cap_archiver is not None:
+            session.enforce_file_cap(
+                on_archive=lambda messages: self._file_cap_archiver(
+                    messages,
+                    session_key=session.key,
+                )
+            )
+
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
 
@@ -587,19 +675,22 @@ class SessionManager:
             if fsync:
                 # fsync the directory so the rename is durable.
                 # On Windows, opening a directory with O_RDONLY raises
-                # PermissionError — skip the dir sync there (NTFS
-                # journals metadata synchronously).
+                # PermissionError; some shared filesystems allow the open but
+                # reject directory fsync with EINVAL.
                 with suppress(PermissionError):
                     fd = os.open(str(path.parent), os.O_RDONLY)
                     try:
                         os.fsync(fd)
+                    except OSError as exc:
+                        if exc.errno != errno.EINVAL:
+                            raise
                     finally:
                         os.close(fd)
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
 
-        self._cache[session.key] = session
+        self._remember(session)
 
     def flush_all(self) -> int:
         """Re-save every cached session with fsync for durable shutdown.
@@ -609,7 +700,9 @@ class SessionManager:
         flushed.
         """
         flushed = 0
-        for key, session in list(self._cache.items()):
+        cached = dict(self._overflow_cache.items())
+        cached.update(self._cache)
+        for key, session in cached.items():
             try:
                 self.save(session, fsync=True)
                 flushed += 1
@@ -620,22 +713,29 @@ class SessionManager:
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
+        self._overflow_cache.pop(key, None)
 
     def delete_session(self, key: str) -> bool:
-        """Remove a session from disk and the in-memory cache.
+        """Remove a session from disk (both workspace and legacy locations) and cache.
 
-        Returns True if a JSONL file was found and unlinked.
+        Returns True if at least one JSONL file was found and unlinked.
         """
-        path = self._get_session_path(key)
+        paths = [
+            self._get_session_path(key),
+            self._get_legacy_lossy_path(key),
+            self._get_legacy_session_path(key),
+        ]
         self.invalidate(key)
-        if not path.exists():
-            return False
-        try:
-            path.unlink()
-            return True
-        except OSError as e:
-            logger.warning("Failed to delete session file {}: {}", path, e)
-            return False
+        deleted = False
+        for path in paths:
+            if not path.exists():
+                continue
+            try:
+                path.unlink()
+                deleted = True
+            except OSError as e:
+                logger.warning("Failed to delete session file {}: {}", path, e)
+        return deleted
 
     def fork_session_before_user_index(
         self,
@@ -653,7 +753,7 @@ class SessionManager:
         """
         if before_user_index < 0:
             return None
-        source = self._cache.get(source_key) or self._load(source_key)
+        source = self._cached(source_key) or self._load(source_key)
         if source is None:
             return None
 
@@ -666,7 +766,7 @@ class SessionManager:
                     found_target = True
                     break
                 user_index += 1
-            copied.append(deepcopy(message))
+            copied.append(public_history_message(message))
         if user_index == before_user_index:
             found_target = True
         if not found_target:
@@ -728,12 +828,53 @@ class SessionManager:
                 "metadata": metadata,
                 "messages": messages,
             }
-        except Exception as e:
+        except _SESSION_DATA_ERRORS as e:
             logger.warning("Failed to read session {}: {}", key, e)
-            repaired = self._repair(key)
+            repaired = self._repair(key, path=path)
             if repaired is not None:
                 logger.info("Recovered read-only session view {} from corrupt file", key)
                 return self._session_payload(repaired)
+            return None
+
+    def read_session_metadata(self, key: str) -> dict[str, Any] | None:
+        """Load only the metadata record from a session file.
+
+        This is used by WebUI routes that need session-level metadata but not the
+        full conversation transcript.
+        """
+        path = self._get_session_path(key)
+        if not path.exists():
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    if not isinstance(data, dict):
+                        raise ValueError("session records must be JSON objects")
+                    if data.get("_type") != "metadata":
+                        return None
+                    metadata = data.get("metadata", {})
+                    return {
+                        "key": data.get("key") or key,
+                        "created_at": data.get("created_at"),
+                        "updated_at": data.get("updated_at"),
+                        "metadata": metadata if isinstance(metadata, dict) else {},
+                    }
+            return None
+        except _SESSION_DATA_ERRORS as e:
+            logger.warning("Failed to read session metadata {}: {}", key, e)
+            repaired = self._repair(key, path=path)
+            if repaired is not None:
+                logger.info("Recovered read-only session metadata {} from corrupt file", key)
+                return {
+                    "key": repaired.key,
+                    "created_at": repaired.created_at.isoformat(),
+                    "updated_at": repaired.updated_at.isoformat(),
+                    "metadata": repaired.metadata,
+                }
             return None
 
     def list_sessions(self) -> list[dict[str, Any]]:
@@ -746,15 +887,19 @@ class SessionManager:
         sessions = []
 
         for path in self.sessions_dir.glob("*.jsonl"):
-            fallback_key = path.stem.replace("_", ":", 1)
+            storage_key = self._session_key_from_path(path)
+            if storage_key is None:
+                continue
             try:
                 # Read the metadata line and a small preview for session lists.
                 with open(path, encoding="utf-8") as f:
                     first_line = f.readline().strip()
                     if first_line:
                         data = json.loads(first_line)
+                        if not isinstance(data, dict):
+                            raise ValueError("session records must be JSON objects")
                         if data.get("_type") == "metadata":
-                            key = data.get("key") or path.stem.replace("_", ":", 1)
+                            key = data.get("key") or storage_key
                             metadata = data.get("metadata", {})
                             title = _metadata_title(metadata)
                             preview = ""
@@ -772,6 +917,8 @@ class SessionManager:
                                 ):
                                     break
                                 item = json.loads(line)
+                                if not isinstance(item, dict):
+                                    raise ValueError("session records must be JSON objects")
                                 if item.get("_type") == "metadata":
                                     continue
                                 text = _message_preview_text(item)
@@ -783,18 +930,21 @@ class SessionManager:
                                 if not fallback_preview and item.get("role") == "assistant":
                                     fallback_preview = text
                             preview = preview or fallback_preview
+                            fallback_time = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
                             sessions.append(
                                 {
                                     "key": key,
-                                    "created_at": data.get("created_at"),
-                                    "updated_at": data.get("updated_at"),
+                                    "created_at": data.get("created_at") or fallback_time,
+                                    "updated_at": data.get("updated_at") or fallback_time,
                                     "title": title,
                                     "preview": preview,
                                     "path": str(path),
                                 }
                             )
-            except Exception:
-                repaired = self._repair(fallback_key)
+            except FileNotFoundError:
+                continue
+            except _SESSION_DATA_ERRORS:
+                repaired = self._repair(storage_key, path=path)
                 if repaired is not None:
                     sessions.append(
                         {

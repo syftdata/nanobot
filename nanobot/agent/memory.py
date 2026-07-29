@@ -13,34 +13,68 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
-import tiktoken
 from loguru import logger
 
-from nanobot.session.manager import Session
+from nanobot.runtime_context import public_history_messages
+from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.gitstore import GitStore
 from nanobot.utils.helpers import (
     ensure_dir,
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
     find_legal_message_start,
+    recent_message_start_index,
     strip_think,
     truncate_text,
+    truncate_text_to_tokens,
 )
 from nanobot.utils.prompt_templates import render_template
+from nanobot.utils.workspace_prompts import (
+    WORKSPACE_PROMPT_MAX_CHARS,
+    has_workspace_prompt_override,
+    load_workspace_prompt_override,
+    workspace_prompt_file,
+)
 
 if TYPE_CHECKING:
-    from nanobot.providers.base import LLMProvider
-    from nanobot.session.manager import SessionManager
-
+    from nanobot.utils.llm_runtime import LLMRuntime
 
 # ---------------------------------------------------------------------------
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
 
+
+class DreamRunProgress:
+    """Track tool failures that make a nominally completed Dream run unsafe to advance."""
+
+    def __init__(self) -> None:
+        self.had_tool_errors = False
+
+    async def __call__(
+        self,
+        *_args: Any,
+        tool_events: list[dict[str, Any]] | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        if any(
+            isinstance(event, dict) and event.get("phase") == "error"
+            for event in tool_events or ()
+        ):
+            self.had_tool_errors = True
+
+
 class MemoryStore:
     """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
 
     _DEFAULT_MAX_HISTORY = 1000
+    # Durable files whose real working-tree delta grounds Dream commit messages.
+    # Deliberately excludes memory/.dream_cursor so progress bookkeeping never
+    # appears as a durable-memory edit in the audit record.
+    _DREAM_CONTENT_PATHS = ("SOUL.md", "USER.md", "memory/MEMORY.md")
+    # Per-file cap when embedding current contents into the Dream prompt. The
+    # durable files are tiny in practice (~5 KB total), but a runaway file must
+    # not unbounded the prompt.
+    _DREAM_FILE_EMBED_CAP = 8000
     _INTERNAL_HISTORY_SESSION_PREFIXES = ("cron:", "dream:")
     _INTERNAL_HISTORY_SESSION_KEYS = {"heartbeat"}
     _LEGACY_ENTRY_START_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}[^\]]*)\]\s*")
@@ -60,8 +94,10 @@ class MemoryStore:
         self.user_file = workspace / "USER.md"
         self._cursor_file = self.memory_dir / ".cursor"
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
-        self._corruption_logged = False  # rate-limit non-int cursor warning
+        self._corruption_logged = False  # rate-limit invalid cursor warning
+        self._malformed_entry_logged = False  # rate-limit bad history shape warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
+        self._dream_prompt_oversize_logged = False
         self._append_lock = threading.Lock()  # serialize cursor allocation + append
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
@@ -289,14 +325,15 @@ class MemoryStore:
 
     @staticmethod
     def _valid_cursor(value: Any) -> int | None:
-        """Int cursors only — reject bool (``isinstance(True, int)`` is True)."""
-        if isinstance(value, bool) or not isinstance(value, int):
+        """Non-negative int cursors only; reject bool (``isinstance(True, int)`` is True)."""
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return None
         return value
 
     def _iter_valid_entries(self) -> Iterator[tuple[dict[str, Any], int]]:
-        """Yield ``(entry, cursor)`` for entries with int cursors; warn once on corruption."""
+        """Yield ``(entry, cursor)`` for well-formed entries; warn once on corruption."""
         poisoned: Any = None
+        malformed_cursor: int | None = None
         for entry in self._read_entries():
             raw = entry.get("cursor")
             if raw is None:
@@ -305,27 +342,60 @@ class MemoryStore:
             if cursor is None:
                 poisoned = raw
                 continue
+            if not self._valid_history_payload(entry):
+                malformed_cursor = cursor
+                continue
             yield entry, cursor
         if poisoned is not None and not self._corruption_logged:
             self._corruption_logged = True
             logger.warning(
-                "history.jsonl contains a non-int cursor ({!r}); dropping it. "
+                "history.jsonl contains an invalid cursor ({!r}); dropping it. "
                 "Usually caused by an external writer; further occurrences suppressed.",
                 poisoned,
             )
+        if malformed_cursor is not None and not self._malformed_entry_logged:
+            self._malformed_entry_logged = True
+            logger.warning(
+                "history.jsonl contains a malformed entry at cursor {}; dropping it. "
+                "Usually caused by an external writer; further occurrences suppressed.",
+                malformed_cursor,
+            )
+
+    @staticmethod
+    def _valid_history_payload(entry: dict[str, Any]) -> bool:
+        if not isinstance(entry.get("timestamp"), str):
+            return False
+        if not isinstance(entry.get("content"), str):
+            return False
+        session_key = entry.get("session_key")
+        return session_key is None or isinstance(session_key, str)
+
+    def _read_cursor_counter(self) -> int | None:
+        """Return the persisted cursor counter when it is usable."""
+        if not self._cursor_file.exists():
+            return None
+        with suppress(ValueError, OSError):
+            cursor = int(self._cursor_file.read_text(encoding="utf-8").strip())
+            if cursor >= 0:
+                return cursor
+        return None
 
     def _next_cursor(self) -> int:
         """Read the current cursor counter and return the next value."""
-        if self._cursor_file.exists():
-            with suppress(ValueError, OSError):
-                return int(self._cursor_file.read_text(encoding="utf-8").strip()) + 1
+        cursor_counter = self._read_cursor_counter()
+        last = self._read_last_entry() or {}
+        last_cursor = self._valid_cursor(last.get("cursor"))
+        if cursor_counter is not None:
+            if last_cursor is not None:
+                return max(cursor_counter, last_cursor) + 1
+            max_history_cursor = max((c for _, c in self._iter_valid_entries()), default=0)
+            return max(cursor_counter, max_history_cursor) + 1
+
         # Fast path: trust the tail when intact.  Otherwise scan the whole
         # file and take ``max`` — that stays correct even if the monotonic
         # invariant was broken by external writes.
-        last = self._read_last_entry() or {}
-        cursor = self._valid_cursor(last.get("cursor"))
-        if cursor is not None:
-            return cursor + 1
+        if last_cursor is not None:
+            return last_cursor + 1
         return max((c for _, c in self._iter_valid_entries()), default=0) + 1
 
     def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
@@ -363,13 +433,33 @@ class MemoryStore:
         ]
 
     def compact_history(self) -> None:
-        """Drop oldest entries if the file exceeds *max_history_entries*."""
+        """Drop oldest processed entries without discarding pending Dream input."""
         if self.max_history_entries <= 0:
             return
         entries = self._read_entries()
         if len(entries) <= self.max_history_entries:
             return
-        kept = entries[-self.max_history_entries:]
+        last_dream_cursor = self.get_last_dream_cursor()
+        first_unprocessed = next(
+            (
+                index
+                for index, entry in enumerate(entries)
+                if (
+                    (cursor := self._valid_cursor(entry.get("cursor"))) is not None
+                    and cursor > last_dream_cursor
+                )
+            ),
+            len(entries),
+        )
+        keep_from = min(len(entries) - self.max_history_entries, first_unprocessed)
+        kept = entries[keep_from:]
+        if len(kept) > self.max_history_entries:
+            logger.warning(
+                "History compaction retained {} unprocessed entries beyond the configured "
+                "limit of {}",
+                len(kept),
+                self.max_history_entries,
+            )
         self._write_entries(kept)
 
     # -- JSONL helpers -------------------------------------------------------
@@ -383,9 +473,11 @@ class MemoryStore:
                     line = line.strip()
                     if line:
                         try:
-                            entries.append(json.loads(line))
+                            parsed = json.loads(line)
                         except json.JSONDecodeError:
                             continue
+                        if isinstance(parsed, dict):
+                            entries.append(parsed)
 
         return entries
 
@@ -403,7 +495,8 @@ class MemoryStore:
                 lines = [line for line in data.split("\n") if line.strip()]
                 if not lines:
                     return None
-                return json.loads(lines[-1])
+                parsed = json.loads(lines[-1])
+                return parsed if isinstance(parsed, dict) else None
         except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
             return None
 
@@ -443,13 +536,52 @@ class MemoryStore:
     def set_last_dream_cursor(self, cursor: int) -> None:
         self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
 
+    def get_latest_cursor(self) -> int:
+        return max(self._next_cursor() - 1, 0)
+
+    @property
+    def dream_prompt_file(self) -> Path:
+        return workspace_prompt_file(self.workspace, "dream")
+
+    def has_dream_prompt_override(self) -> bool:
+        return has_workspace_prompt_override(self.dream_prompt_file)
+
+    @staticmethod
+    def default_dream_prompt() -> str:
+        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+
+        return render_template(
+            "agent/dream.md",
+            strip=True,
+            skill_creator_path=str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"),
+        )
+
+    def _dream_template(self) -> str:
+        text, original_chars = load_workspace_prompt_override(self.dream_prompt_file)
+        if text is not None:
+            if (
+                original_chars > WORKSPACE_PROMPT_MAX_CHARS
+                and not self._dream_prompt_oversize_logged
+            ):
+                self._dream_prompt_oversize_logged = True
+                logger.warning(
+                    "workspace Dream prompt exceeds {} chars ({}); truncating. "
+                    "Further occurrences suppressed.",
+                    WORKSPACE_PROMPT_MAX_CHARS, original_chars,
+                )
+            return text
+        return self.default_dream_prompt()
+
     def build_dream_prompt(self, *, max_entries: int = 20) -> tuple[str, int] | None:
         """Build the Dream prompt with unprocessed history context.
 
         Returns ``(prompt, last_cursor)`` or ``None`` if nothing to process.
-        """
-        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 
+        The current contents of the durable memory files (SOUL.md, USER.md,
+        memory/MEMORY.md) are embedded so the model edits the real files rather
+        than a stale mental model — eliminating a class of failed/out-of-bounds
+        edits that previously produced hallucinated audit records.
+        """
         last_cursor = self.get_last_dream_cursor()
         entries = self.read_unprocessed_history(since_cursor=last_cursor)
         if not entries:
@@ -457,15 +589,48 @@ class MemoryStore:
 
         batch = entries[:max_entries]
         history_text = "\n".join(
-            f"[{e['timestamp']}] {truncate_text(e['content'], 500)}"
+            f"[{e['timestamp']}] {truncate_text(e['content'], 1000)}"
             for e in batch
         )
-        skill_creator_path = str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md")
-        template = render_template(
-            "agent/dream.md", strip=True, skill_creator_path=skill_creator_path,
+        template = self._dream_template()
+        files_section = self._render_current_memory_files()
+        prompt = (
+            f"{template}\n\n{files_section}\n\n"
+            f"## Conversation History\n{history_text}"
         )
-        prompt = f"{template}\n\n## Conversation History\n{history_text}"
         return (prompt, batch[-1]["cursor"])
+
+    def _render_current_memory_files(self) -> str:
+        """Render the durable memory files' current contents for the Dream prompt.
+
+        Missing files render as ``(empty)``; oversized files are capped. The
+        section is the ground truth the model must edit against.
+        """
+        files = [
+            ("SOUL.md", self.soul_file),
+            ("USER.md", self.user_file),
+            ("memory/MEMORY.md", self.memory_file),
+        ]
+        blocks = []
+        for label, path in files:
+            try:
+                content = path.read_text(encoding="utf-8") if path.exists() else ""
+            except OSError:
+                content = ""
+            if len(content) > self._DREAM_FILE_EMBED_CAP:
+                content = truncate_text(content, self._DREAM_FILE_EMBED_CAP) + "\n...[truncated]"
+            blocks.append(f"### {label}\n{content}" if content.strip() else f"### {label}\n(empty)")
+        return "## Current Memory Files\n" + "\n\n".join(blocks)
+
+    def dream_content_diff(self) -> str:
+        """Structured summary of uncommitted changes to the durable memory files.
+
+        Returns "" when git is unavailable or no content file changed. This is
+        the ground-truth input for diff-grounded Dream commit messages.
+        """
+        if not self._git.is_initialized():
+            return ""
+        return self._git.summarize_working_tree(list(self._DREAM_CONTENT_PATHS))
 
     def build_dream_tools(self):
         """Build the restricted tool registry used by Dream runs."""
@@ -482,38 +647,47 @@ class MemoryStore:
         skills_dir.mkdir(parents=True, exist_ok=True)
 
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
-        editable_roots = [self.soul_file, self.user_file, skills_dir]
+        editable_files = [self.memory_file, self.soul_file, self.user_file]
 
         tools.register(ReadFileTool(
             workspace=workspace,
             allowed_dir=workspace,
-            extra_allowed_dirs=extra_read,
+            extra_read_allowed_dirs=extra_read,
             file_states=file_states,
         ))
         tools.register(EditFileTool(
             workspace=workspace,
-            allowed_dir=self.memory_dir,
-            extra_allowed_dirs=editable_roots,
+            allowed_dir=skills_dir,
+            extra_write_allowed_files=editable_files,
             file_states=file_states,
         ))
         tools.register(ApplyPatchTool(
             workspace=workspace,
-            allowed_dir=self.memory_dir,
-            extra_allowed_dirs=editable_roots,
+            allowed_dir=skills_dir,
+            extra_write_allowed_files=editable_files,
             file_states=file_states,
         ))
         tools.register(WriteFileTool(
             workspace=workspace,
             allowed_dir=skills_dir,
+            extra_write_allowed_files=editable_files,
             file_states=file_states,
         ))
         return tools
 
     @staticmethod
-    def dream_run_completed(resp: object | None) -> bool:
-        """Return True only when an ephemeral Dream agent turn completed cleanly."""
+    def dream_run_completed(
+        resp: object | None,
+        *,
+        had_tool_errors: bool = False,
+    ) -> bool:
+        """Return True only when a Dream turn completed without tool failures."""
         metadata = getattr(resp, "metadata", None)
-        return isinstance(metadata, dict) and metadata.get("_stop_reason") == "completed"
+        return (
+            not had_tool_errors
+            and isinstance(metadata, dict)
+            and metadata.get("_stop_reason") == "completed"
+        )
 
     # -- message formatting utility ------------------------------------------
 
@@ -538,7 +712,10 @@ class MemoryStore:
     ) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
-        formatted = truncate_text(self._format_messages(messages), limit)
+        formatted = truncate_text(
+            self._format_messages(public_history_messages(messages)),
+            limit,
+        )
         self.append_history(
             f"[RAW] {len(messages)} messages\n"
             f"{formatted}",
@@ -558,23 +735,36 @@ class MemoryStore:
         return f"dream:{datetime.now():%Y%m%d-%H%M%S}"
 
     @staticmethod
-    def build_dream_commit_message(prefix: str, resp: object | None) -> str:
-        """Build a Dream auto-commit message, appending the LLM summary if present."""
-        msg = prefix
-        if resp is not None and getattr(resp, "content", None):
-            msg = f"{msg}\n\n{resp.content.strip()}"
-        return msg
+    def build_dream_commit_message(prefix: str, diff_body: str) -> str:
+        """Build a Dream commit message grounded in the real working-tree diff.
+
+        *diff_body* is a structured, machine-derived summary of the actual file
+        changes (see :meth:`dream_content_diff` /
+        :meth:`GitStore.summarize_working_tree`). The LLM narrative is
+        deliberately excluded so the audit record (``/dream-log``) reflects the
+        filesystem's truth, not the model's self-report.
+
+        An empty *diff_body* yields the bare *prefix*, which ``auto_commit``
+        turns into a no-op when there is nothing to stage.
+        """
+        diff_body = (diff_body or "").strip()
+        if not diff_body:
+            return prefix
+        return f"{prefix}\n\n{diff_body}"
 
     @staticmethod
     def prune_dream_sessions(sessions_dir: Path, *, keep: int = 10) -> None:
         """Remove the oldest Dream session files, keeping only the N most recent.
 
-        Only files matching ``dream_*.jsonl`` are considered. Non-dream session
-        files are never touched.
+        Only current base64url-encoded Dream session keys are considered.
+        Non-dream session files are never touched.
         """
-        dream_files = sorted(
-            sessions_dir.glob("dream_*.jsonl"), key=lambda p: p.stat().st_mtime,
-        )
+        dream_files = []
+        for path in sessions_dir.glob("*.jsonl"):
+            decoded_key = SessionManager._decode_storage_key(path.stem)
+            if decoded_key is not None and decoded_key.startswith("dream:"):
+                dream_files.append(path)
+        dream_files.sort(key=lambda p: p.stat().st_mtime)
         if len(dream_files) <= keep:
             return
 
@@ -609,22 +799,14 @@ class Consolidator:
     def __init__(
         self,
         store: MemoryStore,
-        provider: LLMProvider,
-        model: str,
         sessions: SessionManager,
-        context_window_tokens: int,
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
-        max_completion_tokens: int = 4096,
         consolidation_ratio: float = 0.5,
         unified_session: bool = False,
     ):
         self.store = store
-        self.provider = provider
-        self.model = model
         self.sessions = sessions
-        self.context_window_tokens = context_window_tokens
-        self.max_completion_tokens = max_completion_tokens
         self.consolidation_ratio = consolidation_ratio
         self.unified_session = unified_session
         self._build_messages = build_messages
@@ -632,17 +814,6 @@ class Consolidator:
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
-
-    def set_provider(
-        self,
-        provider: LLMProvider,
-        model: str,
-        context_window_tokens: int,
-    ) -> None:
-        self.provider = provider
-        self.model = model
-        self.context_window_tokens = context_window_tokens
-        self.max_completion_tokens = provider.generation.max_tokens
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
@@ -673,17 +844,12 @@ class Consolidator:
     @staticmethod
     def _full_unconsolidated_history(
         session: Session,
-        *,
-        include_timestamps: bool = False,
     ) -> list[dict[str, Any]]:
         """Return the whole unconsolidated tail for consolidation decisions."""
         unconsolidated_count = len(session.messages) - session.last_consolidated
         if unconsolidated_count <= 0:
             return []
-        return session.get_history(
-            max_messages=unconsolidated_count,
-            include_timestamps=include_timestamps,
-        )
+        return session.get_history(max_messages=unconsolidated_count)
 
     @staticmethod
     def _replay_overflow_boundary(
@@ -696,7 +862,13 @@ class Consolidator:
         if len(tail) <= replay_max_messages:
             return None
 
-        sliced = tail[-replay_max_messages:]
+        tail_messages = [message for _idx, message in tail]
+        start_idx = recent_message_start_index(
+            tail_messages,
+            replay_max_messages,
+            extend_to_user=True,
+        )
+        sliced = tail[start_idx:]
         for i, (_idx, message) in enumerate(sliced):
             if message.get("role") == "user":
                 start = i
@@ -720,6 +892,8 @@ class Consolidator:
         self,
         session: Session,
         replay_max_messages: int | None,
+        *,
+        runtime: LLMRuntime,
     ) -> str | None:
         """Archive messages that would be hidden by the replay message window."""
         end_idx = self._replay_overflow_boundary(session, replay_max_messages)
@@ -734,7 +908,11 @@ class Consolidator:
             len(chunk),
             replay_max_messages,
         )
-        summary = await self.archive(chunk, session_key=session.key)
+        summary = await self.archive(
+            chunk,
+            runtime=runtime,
+            session_key=session.key,
+        )
         session.last_consolidated = end_idx
         self.sessions.save(session)
         return summary
@@ -750,10 +928,12 @@ class Consolidator:
     def estimate_session_prompt_tokens(
         self,
         session: Session,
+        *,
+        runtime: LLMRuntime,
     ) -> tuple[int, str]:
         """Estimate prompt size from the full unconsolidated session tail."""
-        history = self._full_unconsolidated_history(session, include_timestamps=True)
-        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        history = self._full_unconsolidated_history(session)
+        channel = session.key.split(":", 1)[0] if ":" in session.key else None
         # Include archived summary in estimation so the budget accounts for it.
         meta = session.metadata.get("_last_summary")
         summary = meta.get("text") if isinstance(meta, dict) else (meta if isinstance(meta, str) else None)
@@ -761,87 +941,97 @@ class Consolidator:
             history=history,
             current_message="[token-probe]",
             channel=channel,
-            chat_id=chat_id,
-            sender_id=None,
             session_summary=summary,
-            session_metadata=session.metadata,
             session_key=session.key,
             unified_session=self.unified_session,
         )
         return estimate_prompt_tokens_chain(
-            self.provider,
-            self.model,
+            runtime.provider,
+            runtime.model,
             probe_messages,
             self._get_tool_definitions(),
         )
 
-    @property
-    def _input_token_budget(self) -> int:
+    def _input_token_budget(self, runtime: LLMRuntime) -> int:
         """Available input token budget for consolidation LLM."""
-        return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+        return (
+            runtime.context_window_tokens
+            - runtime.generation.max_tokens
+            - self._SAFETY_BUFFER
+        )
 
-    def _truncate_to_token_budget(self, text: str) -> str:
+    def _truncate_to_token_budget(self, text: str, *, runtime: LLMRuntime) -> str:
         """Truncate text so it fits within the consolidation LLM's token budget."""
-        budget = self._input_token_budget
+        budget = self._input_token_budget(runtime)
         if budget <= 0:
             return truncate_text(text, _RAW_ARCHIVE_MAX_CHARS)
-        try:
-            enc = tiktoken.get_encoding("cl100k_base")
-            tokens = enc.encode(text)
-            if len(tokens) <= budget:
-                return text
-            return enc.decode(tokens[:budget]) + "\n... (truncated)"
-        except Exception:
-            return truncate_text(text, budget * 4)
+        return truncate_text_to_tokens(text, budget)
 
     async def archive(
         self,
         messages: list[dict],
         *,
+        runtime: LLMRuntime,
         session_key: str | None = None,
+        summary_messages: list[dict] | None = None,
     ) -> str | None:
         """Summarize messages via LLM and append to history.jsonl.
+
+        ``messages`` are the messages being archived (removed from the live
+        session); they are what gets raw-dumped if the LLM call fails.
+        ``summary_messages``, when given, lets callers include retained
+        messages in the summary without archiving them.
 
         Returns the summary text on success, None if nothing to archive.
         """
         if not messages:
             return None
+        messages_to_summarize = public_history_messages(
+            summary_messages if summary_messages is not None else messages
+        )
+        formatted = MemoryStore._format_messages(messages_to_summarize)
+        formatted = self._truncate_to_token_budget(formatted, runtime=runtime)
+        system_prompt = render_template(
+            "agent/consolidator_archive.md",
+            strip=True,
+        )
         try:
-            formatted = MemoryStore._format_messages(messages)
-            formatted = self._truncate_to_token_budget(formatted)
-            response = await self.provider.chat_with_retry(
-                model=self.model,
+            response = await runtime.provider.chat_with_retry(
+                model=runtime.model,
                 messages=[
                     {
                         "role": "system",
-                        "content": render_template(
-                            "agent/consolidator_archive.md",
-                            strip=True,
-                        ),
+                        "content": system_prompt,
                     },
                     {"role": "user", "content": formatted},
                 ],
                 tools=None,
                 tool_choice=None,
+                temperature=runtime.generation.temperature,
+                max_tokens=runtime.generation.max_tokens,
+                reasoning_effort=runtime.generation.reasoning_effort,
             )
-            if response.finish_reason == "error":
-                raise RuntimeError(f"LLM returned error: {response.content}")
-            summary = response.content or "[no summary]"
-            self.store.append_history(
-                summary,
-                max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
-                session_key=session_key,
-            )
-            return summary
         except Exception:
-            logger.warning("Consolidation LLM call failed, raw-dumping to history")
+            logger.warning("Consolidation provider call failed, raw-dumping to history")
             self.store.raw_archive(messages, session_key=session_key)
             return None
+        if response.finish_reason == "error":
+            logger.warning("Consolidation provider returned an error, raw-dumping to history")
+            self.store.raw_archive(messages, session_key=session_key)
+            return None
+        summary = response.content or "[no summary]"
+        self.store.append_history(
+            summary,
+            max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
+            session_key=session_key,
+        )
+        return summary
 
     async def maybe_consolidate_by_tokens(
         self,
         session: Session,
         *,
+        runtime: LLMRuntime,
         replay_max_messages: int | None = None,
     ) -> None:
         """Loop: archive old messages until prompt fits within safe budget.
@@ -849,7 +1039,7 @@ class Consolidator:
         The budget reserves space for completion tokens and a safety buffer
         so the LLM request never exceeds the context window.
         """
-        if self.context_window_tokens <= 0:
+        if runtime.context_window_tokens <= 0:
             return
 
         lock = self.get_lock(session.key)
@@ -861,19 +1051,17 @@ class Consolidator:
             if not session.messages:
                 return
 
-            budget = self._input_token_budget
+            budget = self._input_token_budget(runtime)
             target = int(budget * self.consolidation_ratio)
             last_summary = await self._consolidate_replay_overflow(
                 session,
                 replay_max_messages,
+                runtime=runtime,
             )
-            try:
-                estimated, source = self.estimate_session_prompt_tokens(
-                    session,
-                )
-            except Exception:
-                logger.exception("Token estimation failed for {}", session.key)
-                estimated, source = 0, "error"
+            estimated, source = self.estimate_session_prompt_tokens(
+                session,
+                runtime=runtime,
+            )
             if estimated <= 0:
                 self._persist_last_summary(session, last_summary)
                 return
@@ -883,7 +1071,7 @@ class Consolidator:
                     "Token consolidation idle {}: {}/{} via {}, msgs={}",
                     session.key,
                     estimated,
-                    self.context_window_tokens,
+                    runtime.context_window_tokens,
                     source,
                     unconsolidated_count,
                 )
@@ -914,11 +1102,15 @@ class Consolidator:
                     round_num,
                     session.key,
                     estimated,
-                    self.context_window_tokens,
+                    runtime.context_window_tokens,
                     source,
                     len(chunk),
                 )
-                summary = await self.archive(chunk, session_key=session.key)
+                summary = await self.archive(
+                    chunk,
+                    runtime=runtime,
+                    session_key=session.key,
+                )
                 # Advance the cursor either way: on success the chunk was
                 # summarized; on failure archive() already raw-archived it as
                 # a breadcrumb. Re-archiving the same chunk on the next call
@@ -932,13 +1124,10 @@ class Consolidator:
                     # the next invocation can retry a fresh chunk.
                     break
 
-                try:
-                    estimated, source = self.estimate_session_prompt_tokens(
-                        session,
-                    )
-                except Exception:
-                    logger.exception("Token estimation failed for {}", session.key)
-                    estimated, source = 0, "error"
+                estimated, source = self.estimate_session_prompt_tokens(
+                    session,
+                    runtime=runtime,
+                )
                 if estimated <= 0:
                     break
 
@@ -950,6 +1139,8 @@ class Consolidator:
     async def compact_idle_session(
         self,
         session_key: str,
+        *,
+        runtime: LLMRuntime,
         max_suffix: int = 8,
     ) -> str | None:
         """Hard-truncate an idle session under the consolidation lock.
@@ -964,33 +1155,38 @@ class Consolidator:
             self.sessions.invalidate(session_key)
             session = self.sessions.get_or_create(session_key)
 
-            tail = list(session.messages[session.last_consolidated:])
-            if not tail:
-                session.updated_at = datetime.now()
+            messages_to_summarize = list(session.messages[session.last_consolidated:])
+            if not messages_to_summarize:
                 self.sessions.save(session)
                 return ""
 
             probe = Session(
                 key=session.key,
-                messages=tail.copy(),
+                messages=messages_to_summarize.copy(),
                 created_at=session.created_at,
                 updated_at=session.updated_at,
                 metadata={},
                 last_consolidated=0,
             )
-            dropped, already_consolidated = probe.retain_recent_legal_suffix(max_suffix)
-            kept = probe.messages
-            archive_msgs = dropped[already_consolidated:]
+            result = probe.retain_recent_legal_suffix(max_suffix, extend_to_user=True)
+            messages_to_keep = probe.messages
+            messages_to_remove = result.dropped[result.already_consolidated_count:]
 
-            if not archive_msgs and not kept:
-                session.updated_at = datetime.now()
+            if not messages_to_remove and not messages_to_keep:
                 self.sessions.save(session)
                 return ""
 
             last_active = session.updated_at
             summary: str | None = ""
-            if archive_msgs:
-                summary = await self.archive(archive_msgs, session_key=session_key)
+            if messages_to_remove:
+                # Summarize the retained suffix too, but only remove/raw-dump
+                # the messages that are no longer kept in the live session.
+                summary = await self.archive(
+                    messages_to_remove,
+                    runtime=runtime,
+                    session_key=session_key,
+                    summary_messages=messages_to_summarize,
+                )
 
             if summary and summary != "(nothing)":
                 session.metadata["_last_summary"] = {
@@ -998,17 +1194,16 @@ class Consolidator:
                     "last_active": last_active.isoformat(),
                 }
 
-            session.messages = kept
+            session.messages = messages_to_keep
             session.last_consolidated = 0
-            session.updated_at = datetime.now()
             self.sessions.save(session)
 
-            if archive_msgs:
+            if messages_to_remove:
                 logger.info(
                     "Idle-session compact for {}: archived={}, kept={}, summary={}",
                     session_key,
-                    len(archive_msgs),
-                    len(kept),
+                    len(messages_to_remove),
+                    len(messages_to_keep),
                     bool(summary),
                 )
 

@@ -1,14 +1,180 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  assistantCopyFlags,
+  assistantForkFlags,
   buildDisplayUnits,
   ThreadMessages,
+  unitKeysForDisplay,
 } from "@/components/thread/ThreadMessages";
+import { preloadMarkdownText } from "@/components/MarkdownText";
 import type { UIMessage } from "@/lib/types";
 
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
 describe("ThreadMessages", () => {
+  it("does not move a mounted tail answer into offscreen rendering on the next turn", () => {
+    const completed: UIMessage[] = [
+      { id: "u1", role: "user", content: "question", createdAt: 1 },
+      { id: "a1", role: "assistant", content: "latest answer", createdAt: 2 },
+    ];
+    const { rerender } = render(
+      <ThreadMessages messages={completed} isStreaming={false} />,
+    );
+
+    expect(screen.getByText("latest answer").closest(".thread-render-unit")).toBeNull();
+
+    rerender(
+      <ThreadMessages
+        messages={[
+          ...completed,
+          { id: "u2", role: "user", content: "next question", createdAt: 3 },
+        ]}
+        isStreaming
+      />,
+    );
+
+    expect(screen.getByText("latest answer").closest(".thread-render-unit")).toBeNull();
+  });
+
+  it("still defers historical non-tail answers on their initial render", () => {
+    render(
+      <ThreadMessages
+        messages={[
+          { id: "u1", role: "user", content: "old question", createdAt: 1 },
+          { id: "a1", role: "assistant", content: "historical answer", createdAt: 2 },
+          { id: "u2", role: "user", content: "latest question", createdAt: 3 },
+        ]}
+        isStreaming={false}
+      />,
+    );
+
+    expect(screen.getByText("historical answer").closest(".thread-render-unit")).not.toBeNull();
+  });
+
+  it("preserves an answer's markdown tree across completion and the next prompt", async () => {
+    await preloadMarkdownText();
+    const turnId = "turn-1";
+    const streaming: UIMessage[] = [
+      {
+        id: "u1",
+        role: "user",
+        content: "question",
+        createdAt: 1,
+        turnId,
+        turnPhase: "prompt",
+      },
+      {
+        id: "live-answer",
+        role: "assistant",
+        content: "stable final answer",
+        createdAt: 2,
+        isStreaming: true,
+        turnId,
+        turnPhase: "answer",
+      },
+    ];
+    const { container, rerender } = render(
+      <ThreadMessages messages={streaming} isStreaming />,
+    );
+    await waitFor(
+      () => expect(container.querySelector(".markdown-content")).not.toBeNull(),
+      { timeout: 3_000 },
+    );
+    const paragraph = screen.getByText("stable final answer").closest("p");
+    expect(paragraph).not.toBeNull();
+
+    rerender(
+      <ThreadMessages
+        messages={[
+          streaming[0],
+          {
+            ...streaming[1],
+            id: "canonical-answer",
+            isStreaming: false,
+          },
+        ]}
+        isStreaming={false}
+      />,
+    );
+
+    expect(screen.getByText("stable final answer").closest("p")).toBe(paragraph);
+
+    rerender(
+      <ThreadMessages
+        messages={[
+          streaming[0],
+          {
+            ...streaming[1],
+            id: "canonical-answer",
+            isStreaming: false,
+          },
+          {
+            id: "u2",
+            role: "user",
+            content: "next question",
+            createdAt: 3,
+            turnId: "turn-2",
+            turnPhase: "prompt",
+          },
+        ]}
+        isStreaming
+      />,
+    );
+
+    expect(screen.getByText("stable final answer").closest("p")).toBe(paragraph);
+  });
+
+  it("offers a follow-up action for text selected within one completed answer", async () => {
+    const onQuoteSelection = vi.fn();
+    render(
+      <ThreadMessages
+        messages={[{
+          id: "a1",
+          role: "assistant",
+          content: "The selected answer excerpt",
+          createdAt: 1,
+        }]}
+        isStreaming={false}
+        onQuoteSelection={onQuoteSelection}
+      />,
+    );
+
+    const textNode = screen.getByText("The selected answer excerpt").firstChild!;
+    const range = document.createRange();
+    range.setStart(textNode, 4);
+    range.setEnd(textNode, 19);
+    vi.spyOn(range, "getBoundingClientRect").mockReturnValue({
+      left: 100,
+      right: 240,
+      top: 100,
+      bottom: 120,
+      width: 140,
+      height: 20,
+      x: 100,
+      y: 100,
+      toJSON: () => ({}),
+    });
+    const removeAllRanges = vi.fn();
+    vi.spyOn(window, "getSelection").mockReturnValue({
+      isCollapsed: false,
+      rangeCount: 1,
+      getRangeAt: () => range,
+      toString: () => "selected answer",
+      removeAllRanges,
+    } as unknown as Selection);
+
+    document.dispatchEvent(new Event("selectionchange"));
+    const action = await screen.findByRole("button", { name: "Ask about this" });
+    fireEvent.click(action);
+
+    await waitFor(() => expect(onQuoteSelection).toHaveBeenCalledWith("selected answer"));
+    expect(removeAllRanges).toHaveBeenCalled();
+  });
+
   it("groups consecutive reasoning and tool rows into one timeline before the answer", () => {
     const messages: UIMessage[] = [
       {
@@ -70,6 +236,42 @@ describe("ThreadMessages", () => {
     );
 
     expect(screen.getByText("Forked from history")).toBeInTheDocument();
+  });
+
+  it("keeps turn unit keys stable across replayed ids and mutable turn sequence", () => {
+    const liveUnits = buildDisplayUnits([
+      { id: "optimistic-user", role: "user", content: "go", turnId: "turn-1", turnPhase: "user", turnSeq: 0, createdAt: 1 },
+      {
+        id: "live-a1",
+        role: "assistant",
+        content: "first answer slice",
+        turnId: "turn-1",
+        turnPhase: "answer",
+        turnSeq: 2,
+        createdAt: 2,
+      },
+      {
+        id: "live-a2",
+        role: "assistant",
+        content: "second answer slice",
+        turnId: "turn-1",
+        turnPhase: "answer",
+        turnSeq: 20,
+        createdAt: 3,
+      },
+    ]);
+    const replayUnits = buildDisplayUnits([
+      { id: "replayed-user", role: "user", content: "go", turnId: "turn-1", turnPhase: "user", turnSeq: 10, createdAt: 10 },
+      { id: "replayed-a1", role: "assistant", content: "first answer slice", turnId: "turn-1", turnPhase: "answer", turnSeq: 11, createdAt: 11 },
+      { id: "replayed-a2", role: "assistant", content: "second answer slice", turnId: "turn-1", turnPhase: "answer", turnSeq: 99, createdAt: 12 },
+    ]);
+
+    expect(unitKeysForDisplay(liveUnits)).toEqual(unitKeysForDisplay(replayUnits));
+    expect(unitKeysForDisplay(liveUnits)).toEqual([
+      "turn-turn-1-user",
+      "turn-turn-1-answer-1",
+      "turn-turn-1-answer-2",
+    ]);
   });
 
   it("keeps file edits as their own activity row inside a turn", () => {
@@ -256,6 +458,45 @@ describe("ThreadMessages", () => {
     expect(screen.queryByLabelText(/editing foo\.txt/i)).not.toBeInTheDocument();
   });
 
+  it("times live activity from the user turn start", () => {
+    vi.useFakeTimers();
+    const startedAt = 1_700_000_000_000;
+    vi.setSystemTime(startedAt + 230_000);
+    const messages: UIMessage[] = [
+      {
+        id: "u1",
+        role: "user",
+        content: "run it",
+        turnId: "turn-1",
+        turnPhase: "user",
+        turnSeq: 1,
+        createdAt: startedAt,
+      },
+      {
+        id: "t1",
+        role: "tool",
+        kind: "trace",
+        content: "exec()",
+        traces: ["exec()"],
+        turnId: "turn-1",
+        turnPhase: "activity",
+        turnSeq: 2,
+        createdAt: startedAt + 220_000,
+      },
+    ];
+
+    const units = buildDisplayUnits(messages, true);
+
+    expect(
+      units[1].type === "activity" ? units[1].startedAtMs : undefined,
+    ).toBe(startedAt);
+
+    render(<ThreadMessages messages={messages} isStreaming />);
+
+    expect(screen.getByText("Working for 3m 50s")).toBeInTheDocument();
+    expect(screen.queryByText("Working for 10s")).not.toBeInTheDocument();
+  });
+
   it("folds final answer reasoning into the preceding activity timeline", () => {
     const messages: UIMessage[] = [
       {
@@ -308,8 +549,45 @@ describe("ThreadMessages", () => {
 
     render(<ThreadMessages messages={messages} isStreaming={false} />);
     expect(screen.queryByRole("button", { name: /^thinking$/i })).not.toBeInTheDocument();
-    expect(screen.getByText("Thought for 9s")).toBeInTheDocument();
+    expect(screen.getByText("Worked for 9s")).toBeInTheDocument();
     expect(screen.getByText("final answer")).toBeInTheDocument();
+  });
+
+  it("uses final turn latency when an earlier reasoning segment has its own latency", () => {
+    const messages: UIMessage[] = [
+      {
+        id: "r1",
+        role: "assistant",
+        content: "",
+        reasoning: "plan",
+        reasoningStreaming: false,
+        latencyMs: 3_000,
+        createdAt: 1,
+      },
+      {
+        id: "t1",
+        role: "tool",
+        kind: "trace",
+        content: "shell()",
+        traces: ["shell()"],
+        createdAt: 2,
+      },
+      {
+        id: "a1",
+        role: "assistant",
+        content: "done",
+        latencyMs: 20_000,
+        createdAt: 3,
+      },
+    ];
+
+    const units = buildDisplayUnits(messages);
+
+    expect(units[0].type === "activity" ? units[0].turnLatencyMs : undefined).toBe(20_000);
+
+    render(<ThreadMessages messages={messages} isStreaming={false} />);
+    expect(screen.getByText("Worked for 20s")).toBeInTheDocument();
+    expect(screen.queryByText("Worked for 3s")).not.toBeInTheDocument();
   });
 
   it("keeps late activity after the live assistant answer while streaming", () => {
@@ -626,11 +904,11 @@ describe("ThreadMessages", () => {
 
     render(<ThreadMessages messages={messages} isStreaming={false} />);
 
-    expect(screen.getByText("Thought for 15s")).toBeInTheDocument();
-    expect(screen.queryByText("Thought for 0s")).not.toBeInTheDocument();
+    expect(screen.getByText("Worked for 15s")).toBeInTheDocument();
+    expect(screen.queryByText("Worked for 0s")).not.toBeInTheDocument();
   });
 
-  it("shows copy only on the last assistant slice before the next user turn", () => {
+  it("shows copy on every assistant slice while keeping fork on the last slice", () => {
     const messages: UIMessage[] = [
       {
         id: "early",
@@ -654,19 +932,26 @@ describe("ThreadMessages", () => {
       },
     ];
 
-    render(<ThreadMessages messages={messages} isStreaming={false} />);
+    render(
+      <ThreadMessages
+        messages={messages}
+        isStreaming={false}
+        onForkFromMessage={vi.fn()}
+      />,
+    );
 
-    expect(screen.getAllByRole("button", { name: "Copy" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Copy" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Fork" })).toHaveLength(1);
     expect(screen.getByText("final reply")).toBeInTheDocument();
   });
 
-  it("shows copy only on the second assistant when two text slices appear before user", () => {
+  it("shows copy on adjacent assistant text slices", () => {
     const messages: UIMessage[] = [
       { id: "a1", role: "assistant", content: "part one", createdAt: 1 },
       { id: "a2", role: "assistant", content: "part two", createdAt: 2 },
     ];
     render(<ThreadMessages messages={messages} isStreaming={false} />);
-    expect(screen.getAllByRole("button", { name: "Copy" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Copy" })).toHaveLength(2);
   });
 
   it("uses turn ids as activity grouping boundaries when available", () => {
@@ -693,7 +978,7 @@ describe("ThreadMessages", () => {
     ]);
   });
 
-  it("computes final assistant copy flags with user-boundary semantics", () => {
+  it("computes final assistant fork flags with user-boundary semantics", () => {
     const units = buildDisplayUnits([
       { id: "u1", role: "user", content: "one", createdAt: 1 },
       { id: "a1", role: "assistant", content: "draft", createdAt: 2 },
@@ -710,7 +995,7 @@ describe("ThreadMessages", () => {
       { id: "a3", role: "assistant", content: "next", createdAt: 6 },
     ]);
 
-    const flags = assistantCopyFlags(units);
+    const flags = assistantForkFlags(units);
     const assistantFlags = units
       .map((unit, index) =>
         unit.type === "message" && unit.message.role === "assistant"
