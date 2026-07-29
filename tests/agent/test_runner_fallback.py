@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from loguru import logger
 
 from nanobot.config.schema import ModelPresetConfig
 from nanobot.providers.base import LLMProvider, LLMResponse
@@ -284,6 +285,54 @@ class TestFallbackOnPrimaryError:
         assert primary.chat_calls[0]["model"] == "primary-model"
         assert fallback.chat_calls[0]["model"] == "fallback-a"
 
+    @pytest.mark.asyncio
+    async def test_reports_the_fallback_model_before_its_request(self) -> None:
+        primary = _FakeProvider("primary", _error_response())
+        fallback = _FakeProvider("fallback", _make_response("fallback ok"))
+        fallback_models: list[str] = []
+
+        async def _observe(model: str) -> None:
+            fallback_models.append(model)
+
+        fb = FallbackProvider(
+            primary=primary,
+            fallback_presets=[_fallback("fallback-a", provider="backup")],
+            provider_factory=MagicMock(return_value=fallback),
+            fallback_model_observer=_observe,
+        )
+
+        result = await fb.chat_with_retry(
+            messages=[{"role": "user", "content": "hi"}],
+            model="primary-model",
+        )
+
+        assert result.content == "fallback ok"
+        assert fallback_models == ["fallback-a"]
+
+    @pytest.mark.asyncio
+    async def test_logs_primary_error_before_fallback(self) -> None:
+        primary = _FakeProvider("primary", _error_response("primary overloaded"))
+        fallback = _FakeProvider("fallback", _make_response("fallback ok"))
+        factory = MagicMock(return_value=fallback)
+        logs: list[str] = []
+        sink_id = logger.add(lambda message: logs.append(str(message)), format="{message}")
+
+        try:
+            fb = FallbackProvider(
+                primary=primary,
+                fallback_presets=[_fallback("fallback-a")],
+                provider_factory=factory,
+            )
+            await fb.chat(messages=[{"role": "user", "content": "hi"}], model="primary-model")
+        finally:
+            logger.remove(sink_id)
+
+        assert any(
+            "Primary model 'primary-model' failed: primary overloaded; trying fallback 'fallback-a'"
+            in line
+            for line in logs
+        )
+
 
 class TestNoFallbackWhenContentStreamed:
     @pytest.mark.asyncio
@@ -343,6 +392,56 @@ class TestFallbackOnStreamStalledAfterContent:
         assert recoveries == ["recover"]
 
 
+class TestFailoverOnEmptyChoices:
+    """Fallback should trigger when API returns empty choices (no error metadata)."""
+
+    @pytest.mark.asyncio
+    async def test_empty_choices_text_fallback(self) -> None:
+        """_should_fallback should return True for 'API returned empty choices'."""
+        from nanobot.providers.fallback_provider import FallbackProvider
+
+        response = _make_response(
+            "Error: API returned empty choices.",
+            finish_reason="error",
+            error_kind="empty",
+        )
+        # error_kind="empty" matches _FALLBACK_ERROR_KINDS via kind check
+        assert FallbackProvider._should_fallback(response)
+
+    @pytest.mark.asyncio
+    async def test_empty_choices_no_error_kind_text_fallback(self) -> None:
+        """_should_fallback should also match via text token when error_kind is None."""
+        from nanobot.providers.fallback_provider import FallbackProvider
+
+        response = _make_response(
+            "Error: API returned empty choices.",
+            finish_reason="error",
+            # error_kind=None, no status — pure text matching
+        )
+        # "empty" token in _FALLBACK_ERROR_TOKENS matches via text fallback
+        assert FallbackProvider._should_fallback(response)
+
+    @pytest.mark.asyncio
+    async def test_empty_choices_triggers_failover(self) -> None:
+        """End-to-end: empty choices on primary triggers fallback."""
+        primary = _FakeProvider(
+            "primary",
+            _make_response("Error: API returned empty choices.", finish_reason="error"),
+        )
+        fallback = _FakeProvider("fallback", _make_response("fallback ok"))
+        factory = MagicMock(return_value=fallback)
+        fb = FallbackProvider(
+            primary=primary,
+            fallback_presets=[_fallback("fallback-a")],
+            provider_factory=factory,
+        )
+
+        result = await fb.chat(messages=[{"role": "user", "content": "hi"}])
+        assert result.content == "fallback ok"
+        assert result.finish_reason == "stop"
+        factory.assert_called_once()
+
+
 class TestFailoverOnTransientError:
     @pytest.mark.asyncio
     async def test_rate_limit(self) -> None:
@@ -359,6 +458,130 @@ class TestFailoverOnTransientError:
         assert result.content == "fallback ok"
         assert result.finish_reason == "stop"
         factory.assert_called_once_with(_fallback("fallback-a"))
+
+
+class TestFailoverOnArrearageError:
+    @pytest.mark.asyncio
+    async def test_non_retryable_quota_tries_configured_fallback(self) -> None:
+        arrearage = _make_response(
+            "insufficient quota",
+            finish_reason="error",
+            error_status_code=429,
+            error_type="insufficient_quota",
+            error_should_retry=False,
+        )
+        primary = _FakeProvider("primary", arrearage)
+        fallback = _FakeProvider("fallback", _make_response("fallback ok"))
+        fallback_preset = _fallback("fallback-a")
+        factory = MagicMock(return_value=fallback)
+        fb = FallbackProvider(
+            primary=primary,
+            fallback_presets=[fallback_preset],
+            provider_factory=factory,
+        )
+
+        result = await fb.chat(messages=[{"role": "user", "content": "hi"}])
+
+        assert result.content == "fallback ok"
+        factory.assert_called_once_with(fallback_preset)
+
+    @pytest.mark.asyncio
+    async def test_without_fallback_presets_returns_original_error(self) -> None:
+        arrearage = _make_response(
+            "payment required",
+            finish_reason="error",
+            error_status_code=402,
+            error_should_retry=False,
+        )
+        primary = _FakeProvider("primary", arrearage)
+        factory = MagicMock()
+        fb = FallbackProvider(
+            primary=primary,
+            fallback_presets=[],
+            provider_factory=factory,
+        )
+
+        result = await fb.chat(messages=[{"role": "user", "content": "hi"}])
+
+        assert result is arrearage
+        factory.assert_not_called()
+
+
+class TestFailoverOnAuthenticationError:
+    @pytest.mark.parametrize(
+        "authentication_error",
+        [
+            pytest.param(
+                _make_response(
+                    (
+                        "Error: {'error': {'type': 'authentication_error', "
+                        "'message': 'The API Key appears to be invalid or may have expired.'}}"
+                    ),
+                    finish_reason="error",
+                    error_type="authentication_error",
+                    error_should_retry=False,
+                ),
+                id="authentication-error-type",
+            ),
+            pytest.param(
+                _make_response(
+                    "unauthorized",
+                    finish_reason="error",
+                    error_status_code=401,
+                    error_kind="http",
+                    error_should_retry=False,
+                ),
+                id="http-401",
+            ),
+            pytest.param(
+                _make_response(
+                    "bad key",
+                    finish_reason="error",
+                    error_type="invalid_request_error",
+                    error_code="invalid_api_key",
+                    error_should_retry=False,
+                ),
+                id="invalid-api-key-code",
+            ),
+            pytest.param(
+                _make_response(
+                    "credentials have expired",
+                    finish_reason="error",
+                    error_should_retry=False,
+                ),
+                id="expired-credentials-text",
+            ),
+            pytest.param(
+                _make_response(
+                    "permission denied",
+                    finish_reason="error",
+                    error_status_code=403,
+                    error_kind="permission",
+                    error_should_retry=False,
+                ),
+                id="permission-error",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_tries_configured_fallback(
+        self,
+        authentication_error: LLMResponse,
+    ) -> None:
+        primary = _FakeProvider("primary", authentication_error)
+        fallback = _FakeProvider("fallback", _make_response("fallback ok"))
+        fallback_preset = _fallback("fallback-a")
+        factory = MagicMock(return_value=fallback)
+        fb = FallbackProvider(
+            primary=primary,
+            fallback_presets=[fallback_preset],
+            provider_factory=factory,
+        )
+
+        result = await fb.chat(messages=[{"role": "user", "content": "hi"}])
+
+        assert result.content == "fallback ok"
+        factory.assert_called_once_with(fallback_preset)
 
 
 class TestNoFallbackOnNonRetryableError:
@@ -386,14 +609,15 @@ class TestNoFallbackOnNonRetryableError:
         factory.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_auth_error(self) -> None:
+    async def test_content_filter_takes_precedence_over_403(self) -> None:
         primary = _FakeProvider(
             "primary",
             _make_response(
-                "unauthorized",
+                "request blocked by content filter",
                 finish_reason="error",
-                error_status_code=401,
-                error_kind="authentication",
+                error_status_code=403,
+                error_kind="content_filter",
+                error_should_retry=False,
             ),
         )
         factory = MagicMock()

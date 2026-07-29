@@ -3,7 +3,7 @@ import copy
 
 import pytest
 
-from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse
+from nanobot.providers.base import RETRY_AFTER_BUFFER, GenerationSettings, LLMProvider, LLMResponse
 
 
 class ScriptedProvider(LLMProvider):
@@ -309,7 +309,7 @@ async def test_non_transient_error_with_images_retries_without_images() -> None:
         content = msg.get("content")
         if isinstance(content, list):
             assert all(b.get("type") != "image_url" for b in content)
-            assert any("[image: /media/test.png]" in (b.get("text") or "") for b in content)
+            assert any("not delivered" in (b.get("text") or "").lower() for b in content)
 
 
 @pytest.mark.asyncio
@@ -327,7 +327,7 @@ async def test_successful_image_retry_mutates_original_messages_in_place() -> No
     content = messages[0]["content"]
     assert isinstance(content, list)
     assert all(block.get("type") != "image_url" for block in content)
-    assert any("[image: /media/test.png]" in (block.get("text") or "") for block in content)
+    assert any("not delivered" in (block.get("text") or "").lower() for block in content)
 
 
 @pytest.mark.asyncio
@@ -362,7 +362,7 @@ async def test_image_fallback_returns_error_on_second_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_image_fallback_without_meta_uses_default_placeholder() -> None:
-    """When _meta is absent, fallback placeholder is '[image omitted]'."""
+    """When _meta is absent, fallback placeholder is non-descriptive."""
     provider = ScriptedProvider([
         LLMResponse(content="error", finish_reason="error"),
         LLMResponse(content="ok"),
@@ -376,7 +376,7 @@ async def test_image_fallback_without_meta_uses_default_placeholder() -> None:
     for msg in msgs_on_retry:
         content = msg.get("content")
         if isinstance(content, list):
-            assert any("[image omitted]" in (b.get("text") or "") for b in content)
+            assert any("not delivered" in (b.get("text") or "").lower() for b in content)
 
 
 @pytest.mark.asyncio
@@ -402,8 +402,8 @@ async def test_chat_with_retry_uses_retry_after_and_emits_wait_progress(monkeypa
     )
 
     assert response.content == "ok"
-    assert delays == [7.0]
-    assert progress and "7s" in progress[0]
+    assert delays == [7.0 + RETRY_AFTER_BUFFER]
+    assert progress and f"{int(7 + RETRY_AFTER_BUFFER)}s" in progress[0]
 
 
 def test_extract_retry_after_supports_common_provider_formats() -> None:
@@ -444,7 +444,7 @@ async def test_chat_with_retry_prefers_structured_retry_after_when_present(monke
     response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
 
     assert response.content == "ok"
-    assert delays == [9.0]
+    assert delays == [9.0 + RETRY_AFTER_BUFFER]
 
 
 @pytest.mark.asyncio
@@ -521,7 +521,7 @@ async def test_chat_with_retry_retries_429_transient_rate_limit(monkeypatch) -> 
 
     assert response.content == "ok"
     assert provider.calls == 2
-    assert delays == [0.2]
+    assert delays == [0.2 + RETRY_AFTER_BUFFER]
 
 
 @pytest.mark.asyncio
@@ -591,7 +591,7 @@ async def test_chat_with_retry_prefers_structured_retry_after(monkeypatch) -> No
     response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
 
     assert response.content == "ok"
-    assert delays == [0.2]
+    assert delays == [0.2 + RETRY_AFTER_BUFFER]
 
 
 @pytest.mark.asyncio

@@ -31,13 +31,9 @@ class AgentProgressHook(AgentHook):
         on_tool_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         *,
         channel: str = "cli",
-        chat_id: str = "direct",
-        message_id: str | None = None,
-        metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         tool_hint_max_length: int = 40,
         tool_hint_labels: dict[str, str] | None = None,
-        set_tool_context: Callable[..., None] | None = None,
         on_iteration: Callable[[int], None] | None = None,
     ) -> None:
         super().__init__(reraise=True)
@@ -46,13 +42,9 @@ class AgentProgressHook(AgentHook):
         self._on_stream_end = on_stream_end
         self._on_tool_step = on_tool_step
         self._channel = channel
-        self._chat_id = chat_id
-        self._message_id = message_id
-        self._metadata = metadata or {}
         self._session_key = session_key
         self._tool_hint_max_length = tool_hint_max_length
         self._tool_hint_labels = tool_hint_labels or {}
-        self._set_tool_context = set_tool_context
         self._on_iteration = on_iteration
         self._stream_buf = ""
         self._think_extractor = IncrementalThinkExtractor()
@@ -99,7 +91,13 @@ class AgentProgressHook(AgentHook):
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
         await self.emit_reasoning_end()
         if self._on_stream_end:
-            await self._on_stream_end(resuming=resuming)
+            kwargs: dict[str, bool] = {"resuming": resuming}
+            if (
+                context.stream_continues_current_message
+                and self._on_progress_accepts(self._on_stream_end, "merge_next")
+            ):
+                kwargs["merge_next"] = True
+            await self._on_stream_end(**kwargs)
         self._stream_buf = ""
         self._think_extractor.reset()
 
@@ -111,6 +109,61 @@ class AgentProgressHook(AgentHook):
             context.iteration,
             self._session_key,
         )
+
+    async def on_provider_tool_event(
+        self,
+        context: AgentHookContext,
+        event: dict[str, Any],
+    ) -> None:
+        if not self._on_progress:
+            return
+        phase = event.get("phase")
+        name = event.get("name")
+        call_id = event.get("call_id")
+        if (
+            phase not in {"start", "end", "error"}
+            or not isinstance(name, str)
+            or not name
+            or not call_id
+        ):
+            return
+        arguments = event.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        payload = {
+            "version": 1,
+            "phase": phase,
+            "call_id": str(call_id),
+            "name": name,
+            "arguments": arguments,
+            "result": event.get("result") if phase == "end" else None,
+            "error": event.get("error") if phase == "error" else None,
+            "files": [],
+            "embeds": [],
+        }
+        if phase == "start":
+            await self.emit_reasoning_end()
+            tool_call = ToolCallRequest(id=str(call_id), name=name, arguments=arguments)
+            tool_hint = self._strip_think(self._tool_hint([tool_call])) or name
+            await invoke_on_progress(
+                self._on_progress,
+                tool_hint,
+                tool_hint=True,
+                tool_events=[payload],
+            )
+            logger.info(
+                "Provider-hosted tool call: {}({})",
+                name,
+                json.dumps(arguments, ensure_ascii=False)[:200],
+            )
+            return
+        if on_progress_accepts_tool_events(self._on_progress):
+            await invoke_on_progress(
+                self._on_progress,
+                "",
+                tool_hint=False,
+                tool_events=[payload],
+            )
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         if self._on_progress:
@@ -131,14 +184,6 @@ class AgentProgressHook(AgentHook):
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
-        if self._set_tool_context:
-            self._set_tool_context(
-                self._channel,
-                self._chat_id,
-                self._message_id,
-                self._metadata,
-                session_key=self._session_key,
-            )
 
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         """Publish a reasoning chunk; channel plugins decide whether to render."""
@@ -158,18 +203,40 @@ class AgentProgressHook(AgentHook):
         else:
             self._reasoning_open = False
 
+    async def before_execute_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+    ) -> None:
+        await self.before_run_tool(context, tool_call)
+
+    async def after_execute_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+        result: Any,
+    ) -> None:
+        await self.after_run_tool(context, tool_call, result, None)
+
+    async def on_execute_tool_error(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+        error: Any,
+    ) -> None:
+        err = error if isinstance(error, BaseException) else RuntimeError(str(error))
+        await self.after_run_tool(context, tool_call, error, err)
+
     async def before_run_tool(
         self, context: AgentHookContext, tool_call: ToolCallRequest
     ) -> None:
-        """Emit a ``tool_step`` ``running`` frame the moment this tool starts.
-
-        We fire per-tool (rather than once per batch in
-        ``before_execute_tools``) so streaming clients can render the "tool
-        is working" card immediately, even while earlier tools in the same
-        batch are still executing concurrently. The ``message`` tool is
-        handled via ``on_stream`` in ``after_run_tool`` instead — it surfaces
-        to the user as normal assistant text rather than a tool card.
-        """
+        """Emit a running tool-step frame as each API-channel tool starts."""
         if self._channel != "api":
             return
         if self._on_tool_step is None or tool_call.name == "message":
@@ -192,13 +259,7 @@ class AgentProgressHook(AgentHook):
         result: Any,
         error: BaseException | None,
     ) -> None:
-        """Emit a ``tool_step`` ``completed``/``error`` frame the moment this
-        tool finishes, or stream ``message`` tool content as assistant text.
-
-        Gated on the "api" channel so we don't double-deliver into
-        slack/feishu (those channels receive ``message`` output via their own
-        bus handler).
-        """
+        """Stream API-channel MessageTool content or emit terminal tool-step frames."""
         if self._channel != "api":
             return
 
@@ -236,8 +297,6 @@ class AgentProgressHook(AgentHook):
 
     @staticmethod
     def _summarize_tool_result(result: Any) -> Any:
-        """Coerce a tool result into something JSON-serialisable for the
-        ``tool_step`` SSE payload: either a primitive/string or a small dict."""
         if result is None:
             return None
         if isinstance(result, (str, int, float, bool)):

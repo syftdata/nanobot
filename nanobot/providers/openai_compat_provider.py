@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import secrets
 import string
 import time
@@ -25,6 +26,7 @@ from nanobot.providers.base import (
     LLMResponse,
     ToolCallRequest,
     parse_tool_arguments,
+    resolve_stream_idle_timeout_s,
     tool_arguments_json_for_replay,
 )
 from nanobot.providers.openai_responses import (
@@ -57,11 +59,24 @@ _DEFAULT_OPENROUTER_HEADERS = {
     "X-OpenRouter-Title": "nanobot",
     "X-OpenRouter-Categories": "cli-agent,personal-agent",
 }
+_KIMI_K3_MODEL = "kimi-k3"
 _KIMI_THINKING_MODELS: frozenset[str] = frozenset({
     "kimi-k2.5",
     "kimi-k2.6",
+    "kimi-k2.7",
+    "kimi-k2.7-code",
+    "kimi-k2.7-code-highspeed",
     "k2.6-code-preview",
 })
+_KIMI_ALWAYS_THINKING_MODELS: frozenset[str] = frozenset({
+    "kimi-k2.7-code",
+    "kimi-k2.7-code-highspeed",
+})
+_KIMI_SERVER_MANAGED_TEMPERATURE_MODELS: frozenset[str] = frozenset({
+    "kimi-k2.5",
+    "kimi-k2.6",
+})
+_TEXT_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 # Thinking-capable MiMo models per Xiaomi docs (see
 # tests/providers/test_xiaomi_mimo_thinking.py). mimo-v2-flash is omitted
 # because it does not support thinking.
@@ -84,9 +99,20 @@ _THINKING_STYLE_MAP: dict[str, Any] = {
 _GATEWAY_REASONING_STYLE_MAP: dict[str, Any] = {
     "reasoning_effort": lambda effort: {"reasoning": {"effort": effort}},
 }
+_QWEN_THINKING_MODELS: frozenset[str] = frozenset({
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.6-max-preview",
+    "qwen3.6-plus",
+    "qwen3.6-flash",
+    "qwen3.5-plus",
+    "qwen3.5-flash",
+})
+
 _MODEL_THINKING_STYLES: dict[str, str] = {
     **dict.fromkeys(_KIMI_THINKING_MODELS, "thinking_type"),
     **dict.fromkeys(_MIMO_THINKING_MODELS, "thinking_type"),
+    **dict.fromkeys(_QWEN_THINKING_MODELS, "enable_thinking"),
 }
 
 
@@ -99,9 +125,9 @@ def _provider_prefix_key(name: str) -> str:
 
 
 def _requires_max_completion_tokens(model_name: str) -> bool:
-    """Return True for models that reject ``max_tokens`` (GPT-5 family, o-series)."""
+    """Return True for models that require ``max_completion_tokens``."""
     slug = _model_slug(model_name)
-    return "gpt-5" in slug or any(
+    return slug == _KIMI_K3_MODEL or "gpt-5" in slug or any(
         slug == p or slug.startswith((p + "-", p + ".")) for p in ("o1", "o3", "o4")
     )
 
@@ -157,6 +183,72 @@ def _short_tool_id() -> str:
     return "".join(secrets.choice(_ALNUM) for _ in range(9))
 
 
+def _coerce_tool_call_args(raw: Any) -> Any:
+    """Normalize empty non-object tool arguments as a no-argument call."""
+    parsed = parse_tool_arguments(raw)
+    if isinstance(parsed, dict):
+        return parsed
+    if not parsed:
+        return {}
+    return parsed
+
+
+def _strip_json_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```") or not stripped.endswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) < 2:
+        return stripped
+    return "\n".join(lines[1:-1]).strip()
+
+
+def _extract_text_tool_calls(content: str | None) -> tuple[str | None, list[ToolCallRequest]]:
+    """Normalize common text-format tool call blocks into structured calls."""
+    if not content or "<tool_call>" not in content:
+        return content, []
+
+    tool_calls: list[ToolCallRequest] = []
+    spans: list[tuple[int, int]] = []
+    for match in _TEXT_TOOL_CALL_RE.finditer(content):
+        try:
+            payload = json.loads(_strip_json_fence(match.group(1)))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        nested = payload.get("tool_call")
+        if isinstance(nested, dict):
+            payload = nested
+        function = payload.get("function")
+        if not isinstance(function, dict):
+            function = payload
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+
+        arguments = function.get("arguments", payload.get("arguments", {}))
+        tool_calls.append(ToolCallRequest(
+            id=str(payload.get("id") or _short_tool_id()),
+            name=name,
+            arguments=parse_tool_arguments(arguments),
+        ))
+        spans.append(match.span())
+
+    if not tool_calls:
+        return content, []
+
+    visible_parts: list[str] = []
+    last = 0
+    for start, end in spans:
+        visible_parts.append(content[last:start])
+        last = end
+    visible_parts.append(content[last:])
+    visible_content = "".join(visible_parts).strip() or None
+    return visible_content, tool_calls
+
+
 def _get(obj: Any, key: str) -> Any:
     """Get a value from dict or object attribute, returning None if absent."""
     if isinstance(obj, dict):
@@ -176,32 +268,6 @@ def _coerce_dict(value: Any) -> dict[str, Any] | None:
         if isinstance(dumped, dict) and dumped:
             return dumped
     return None
-
-
-def _coerce_tool_call_args(raw: Any) -> Any:
-    """Normalize tool-call arguments, treating empty non-object payloads as no-args.
-
-    Builds on :func:`parse_tool_arguments` (which preserves malformed JSON so
-    ToolRegistry can reject it) but additionally maps the Gemini "no arguments"
-    encodings to an empty dict:
-
-      - OpenAI / Anthropic: ``"{}"``
-      - Gemini (via its OpenAI-compatible endpoint): ``"[]"`` or ``""``
-      - Some older proxies: ``null`` or a bare dict already
-
-    ``"[]"`` decodes to a Python list, which downstream tool validation rejects
-    with ``"parameters must be an object, got list"`` — forcing the agent
-    through a wasted retry round-trip. We treat an *empty* non-dict payload as
-    the empty-args case so tools with only-optional parameters execute on the
-    first try, while still preserving non-empty malformed payloads so the
-    registry can reject genuinely bad arguments.
-    """
-    parsed = parse_tool_arguments(raw)
-    if isinstance(parsed, dict):
-        return parsed
-    if not parsed:
-        return {}
-    return parsed
 
 
 def _extract_tc_extras(tc: Any) -> tuple[
@@ -376,6 +442,7 @@ class OpenAICompatProvider(LLMProvider):
         extra_body: dict[str, Any] | None = None,
         api_type: str = "auto",
         extra_query: dict[str, str] | None = None,
+        proxy: str | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
@@ -384,6 +451,7 @@ class OpenAICompatProvider(LLMProvider):
         self._extra_body = extra_body or {}
         self._api_type = api_type if spec and spec.name == "openai" else "auto"
         self._extra_query = extra_query or {}
+        self._proxy = proxy or None
 
         if api_key and spec and spec.env_key:
             self._setup_env(api_key, api_base)
@@ -414,7 +482,14 @@ class OpenAICompatProvider(LLMProvider):
 
         timeout_s = _openai_compat_timeout_s()
         http_client: httpx.AsyncClient | None = None
-        if self._is_local:
+        if self._proxy:
+            http_client = httpx.AsyncClient(
+                timeout=timeout_s,
+                proxy=self._proxy,
+                trust_env=False,
+                follow_redirects=True,
+            )
+        elif self._is_local:
             # Local model servers (Ollama, llama.cpp, vLLM) often close idle
             # HTTP connections before the client-side keepalive expires. When
             # two LLM calls happen seconds apart (e.g. heartbeat _decide then
@@ -424,10 +499,20 @@ class OpenAICompatProvider(LLMProvider):
             # opening a fresh connection for each request, which is cheap on a
             # LAN. Cloud providers benefit from keepalive, so we leave the
             # default pool settings for them.
+            #
+            # Also disable proxy for local endpoints: when the host has
+            # HTTP_PROXY / HTTPS_PROXY / ALL_PROXY set, httpx would try to
+            # route local traffic through the proxy, which typically cannot
+            # reach localhost or LAN addresses.
+            _local_limits = httpx.Limits(keepalive_expiry=0)
             http_client = httpx.AsyncClient(
-                limits=httpx.Limits(keepalive_expiry=0),
+                limits=_local_limits,
                 timeout=timeout_s,
+                transport=httpx.AsyncHTTPTransport(proxy=None, limits=_local_limits),
             )
+        # else: http_client stays None → SDK creates DefaultAsyncHttpxClient
+        # which already reads proxy env vars via trust_env=True, has proper
+        # connection limits, and follows redirects.
         self._client = AsyncOpenAI(
             api_key=self._api_key_for_client,
             base_url=self._effective_base,
@@ -543,6 +628,13 @@ class OpenAICompatProvider(LLMProvider):
         pending_tool_ids: dict[str, deque[str]] = {}
         force_string_content = bool(self._spec and self._spec.name == "deepseek")
         normalize_tool_ids = self._should_normalize_tool_call_ids()
+        strip_reasoning = bool(
+            self._spec
+            and getattr(self._spec, "strip_history_reasoning_content", False)
+        )
+        if strip_reasoning:
+            for msg in sanitized:
+                msg.pop("reasoning_content", None)
 
         def map_id(value: Any) -> Any:
             if not isinstance(value, str):
@@ -646,9 +738,12 @@ class OpenAICompatProvider(LLMProvider):
     ) -> bool:
         """Return True when the model accepts a temperature parameter.
 
-        GPT-5 family and reasoning models (o1/o3/o4) reject temperature
-        when reasoning_effort is set to anything other than ``"none"``.
+        Kimi K3 uses a fixed temperature that should be omitted. GPT-5 family
+        and reasoning models (o1/o3/o4) reject temperature when
+        reasoning_effort is set to anything other than ``"none"``.
         """
+        if _model_slug(model_name) == _KIMI_K3_MODEL:
+            return False
         if reasoning_effort and reasoning_effort.lower() != "none":
             return False
         name = model_name.lower()
@@ -698,6 +793,16 @@ class OpenAICompatProvider(LLMProvider):
                     kwargs.update(overrides)
                     break
 
+        # Moonshot selects the only valid temperature from the K2.5/K2.6 thinking mode:
+        # 1.0 when enabled and 0.6 when disabled. Omitting the parameter lets the API
+        # apply the matching value for both its default and explicit thinking controls.
+        if (
+            spec
+            and spec.name == "moonshot"
+            and _model_slug(model_name) in _KIMI_SERVER_MANAGED_TEMPERATURE_MODELS
+        ):
+            kwargs.pop("temperature", None)
+
         # Normalize reasoning_effort into a semantic form (OpenAI vocab)
         # used for internal decisions, and a wire form actually sent out.
         # "minimum" is accepted as a DashScope-native alias for "minimal".
@@ -708,11 +813,49 @@ class OpenAICompatProvider(LLMProvider):
                 semantic_effort = "minimal"
 
         wire_effort = reasoning_effort
+        slug = _model_slug(model_name)
+        if slug == _KIMI_K3_MODEL and semantic_effort is not None:
+            # K3 always reasons and currently accepts only the top-level
+            # reasoning_effort="max". Preserve disabled/default semantics by
+            # omitting the field; normalize older enabled presets to "max" so
+            # switching from a K2.x model does not send an unsupported value.
+            if semantic_effort in ("none", "minimal"):
+                wire_effort = None
+            else:
+                semantic_effort = "max"
+                wire_effort = "max"
         if spec and spec.name == "dashscope" and semantic_effort == "minimal":
             # DashScope accepts none/minimum/low/medium/high/xhigh; "minimal" 400s.
             wire_effort = "minimum"
 
-        if wire_effort and semantic_effort != "none":
+        # Magistral and other providers where reasoning is implicit reject the
+        # reasoning_effort kwarg entirely. Strip it before the remap so we don't
+        # accidentally send "none"/"high" to a model that always reasons.
+        strip_effort = False
+        if spec and getattr(spec, "implicit_reasoning_models", ()):
+            model_lower = model_name.lower()
+            strip_effort = any(
+                pat in model_lower for pat in spec.implicit_reasoning_models
+            )
+
+        # Some providers accept a constrained reasoning_effort vocabulary
+        # (Mistral: only "high"/"none"). Remap from OpenAI vocab to the
+        # provider's accepted set; an empty mapped value means "omit".
+        if (
+            not strip_effort
+            and spec
+            and getattr(spec, "reasoning_effort_remap", ())
+            and isinstance(semantic_effort, str)
+        ):
+            remap = dict(spec.reasoning_effort_remap)
+            mapped = remap.get(semantic_effort)
+            if mapped is not None:
+                wire_effort = mapped or None
+                semantic_effort = mapped or "none"
+
+        if strip_effort:
+            wire_effort = None
+        elif wire_effort and semantic_effort != "none":
             kwargs["reasoning_effort"] = wire_effort
 
         # Only send thinking controls when reasoning_effort is explicit so
@@ -720,11 +863,17 @@ class OpenAICompatProvider(LLMProvider):
         if reasoning_effort is not None:
             thinking_enabled = semantic_effort not in ("none", "minimal")
             for thinking_style in _thinking_styles_for(spec, model_name):
+                if not thinking_enabled and slug in _KIMI_ALWAYS_THINKING_MODELS:
+                    continue
                 extra = _thinking_extra_body(thinking_style, thinking_enabled)
                 if extra:
                     kwargs.setdefault("extra_body", {}).update(extra)
             gateway_style = getattr(spec, "gateway_reasoning_style", "") if spec else ""
-            if gateway_style and _model_thinking_style(model_name):
+            if (
+                gateway_style
+                and _model_thinking_style(model_name)
+                and (thinking_enabled or slug not in _KIMI_ALWAYS_THINKING_MODELS)
+            ):
                 extra = _gateway_reasoning_extra_body(gateway_style, semantic_effort)
                 if extra:
                     kwargs.setdefault("extra_body", {}).update(extra)
@@ -734,7 +883,7 @@ class OpenAICompatProvider(LLMProvider):
             # user's intent via the provider-native shape, so drop the
             # redundant wire-level kwarg.  Only kimi models need this —
             # Xiaomi's API accepts both params.
-            if _model_slug(model_name) in _KIMI_THINKING_MODELS:
+            if slug in _KIMI_THINKING_MODELS:
                 kwargs.pop("reasoning_effort", None)
 
         if tools:
@@ -932,6 +1081,10 @@ class OpenAICompatProvider(LLMProvider):
             for item in value:
                 item_map = cls._maybe_mapping(item)
                 if item_map:
+                    # Skip Mistral-style {"type":"thinking","thinking":[...]}
+                    # blocks: their text belongs in reasoning_content.
+                    if item_map.get("type") == "thinking":
+                        continue
                     text = item_map.get("text")
                     if isinstance(text, str):
                         parts.append(text)
@@ -944,6 +1097,31 @@ class OpenAICompatProvider(LLMProvider):
                     parts.append(item)
             return "".join(parts) or None
         return str(value)
+
+    @classmethod
+    def _extract_thinking_content(cls, value: Any) -> str | None:
+        """Extract reasoning text from Mistral-style thinking blocks.
+
+        Mistral returns content as a list mixing
+        ``{"type":"thinking","thinking":[{"type":"text","text":...}]}`` and
+        ``{"type":"text","text":...}``. The thinking text belongs in
+        ``reasoning_content`` so the agent can surface it as a reasoning
+        trace rather than as the assistant's reply.
+        """
+        if not isinstance(value, list):
+            return None
+        parts: list[str] = []
+        for item in value:
+            item_map = cls._maybe_mapping(item)
+            if not item_map:
+                continue
+            if item_map.get("type") != "thinking":
+                continue
+            inner = item_map.get("thinking")
+            text = cls._extract_text_content(inner)
+            if text:
+                parts.append(text)
+        return "".join(parts) or None
 
     @classmethod
     def _extract_usage(cls, response: Any) -> dict[str, int]:
@@ -1032,7 +1210,11 @@ class OpenAICompatProvider(LLMProvider):
                         finish_reason=str(response_map.get("finish_reason") or "stop"),
                         usage=self._extract_usage(response_map),
                     )
-                return LLMResponse(content="Error: API returned empty choices.", finish_reason="error")
+                return LLMResponse(
+                    content="Error: API returned empty choices.",
+                    finish_reason="error",
+                    error_kind="empty",
+                )
 
             choice0 = self._maybe_mapping(choices[0]) or {}
             msg0 = self._maybe_mapping(choice0.get("message")) or {}
@@ -1046,6 +1228,12 @@ class OpenAICompatProvider(LLMProvider):
             reasoning_content = msg0.get("reasoning_content")
             if reasoning_content is None and msg0.get("reasoning"):
                 reasoning_content = self._extract_text_content(msg0.get("reasoning"))
+            # Mistral reasoning models return thinking text inside the content
+            # array; lift it into reasoning_content so the runner records it
+            # under the reasoning trace.
+            spec = getattr(self, "_spec", None)
+            if reasoning_content is None and getattr(spec, "extract_thinking_blocks", False):
+                reasoning_content = self._extract_thinking_content(msg0.get("content"))
             for ch in choices:
                 ch_map = self._maybe_mapping(ch) or {}
                 m = self._maybe_mapping(ch_map.get("message")) or {}
@@ -1059,19 +1247,29 @@ class OpenAICompatProvider(LLMProvider):
                 if reasoning_content is None:
                     reasoning_content = m.get("reasoning_content")
 
+            # Deduplicate tool call IDs (same pattern as streaming path)
+            # Some providers reuse the same ID for parallel tool calls.
+            _seen_tc_ids: set[str] = set()
             parsed_tool_calls = []
             for tc in raw_tool_calls:
                 tc_map = self._maybe_mapping(tc) or {}
                 fn = self._maybe_mapping(tc_map.get("function")) or {}
+                args = _coerce_tool_call_args(fn.get("arguments", {}))
                 ec, prov, fn_prov = _extract_tc_extras(tc)
+                raw_id = str(tc_map.get("id") or _short_tool_id())
+                if not raw_id or raw_id in _seen_tc_ids:
+                    raw_id = _short_tool_id()
+                _seen_tc_ids.add(raw_id)
                 parsed_tool_calls.append(ToolCallRequest(
-                    id=str(tc_map.get("id") or _short_tool_id()),
+                    id=raw_id,
                     name=str(fn.get("name") or ""),
-                    arguments=_coerce_tool_call_args(fn.get("arguments", {})),
+                    arguments=args,
                     extra_content=ec,
                     provider_specific_fields=prov,
                     function_provider_specific_fields=fn_prov,
                 ))
+            if not parsed_tool_calls:
+                content, parsed_tool_calls = _extract_text_tool_calls(content)
 
             return LLMResponse(
                 content=content,
@@ -1082,7 +1280,11 @@ class OpenAICompatProvider(LLMProvider):
             )
 
         if not response.choices:
-            return LLMResponse(content="Error: API returned empty choices.", finish_reason="error")
+            return LLMResponse(
+                content="Error: API returned empty choices.",
+                finish_reason="error",
+                error_kind="empty",
+            )
 
         choice = response.choices[0]
         msg = choice.message
@@ -1103,15 +1305,18 @@ class OpenAICompatProvider(LLMProvider):
 
         tool_calls = []
         for tc in raw_tool_calls:
+            args = _coerce_tool_call_args(tc.function.arguments)
             ec, prov, fn_prov = _extract_tc_extras(tc)
             tool_calls.append(ToolCallRequest(
                 id=str(getattr(tc, "id", None) or _short_tool_id()),
                 name=tc.function.name,
-                arguments=_coerce_tool_call_args(tc.function.arguments),
+                arguments=args,
                 extra_content=ec,
                 provider_specific_fields=prov,
                 function_provider_specific_fields=fn_prov,
             ))
+        if not tool_calls:
+            content, tool_calls = _extract_text_tool_calls(content)
 
         reasoning_content = getattr(msg, "reasoning_content", None)
         if reasoning_content is None and getattr(msg, "reasoning", None):
@@ -1194,12 +1399,17 @@ class OpenAICompatProvider(LLMProvider):
                 if choice.get("finish_reason"):
                     finish_reason = str(choice["finish_reason"])
                 delta = cls._maybe_mapping(choice.get("delta")) or {}
-                text = cls._extract_text_content(delta.get("content"))
+                raw_delta_content = delta.get("content")
+                text = cls._extract_text_content(raw_delta_content)
                 if text:
                     content_parts.append(text)
                 text = cls._extract_text_content(delta.get("reasoning_content"))
                 if not text:
                     text = cls._extract_text_content(delta.get("reasoning"))
+                if not text:
+                    # Mistral streams thinking inside the content array as
+                    # {"type":"thinking", thinking:[{"type":"text", ...}]}.
+                    text = cls._extract_thinking_content(raw_delta_content)
                 if text:
                     reasoning_parts.append(text)
                 for idx, tc in enumerate(delta.get("tool_calls") or []):
@@ -1216,13 +1426,20 @@ class OpenAICompatProvider(LLMProvider):
                 finish_reason = choice.finish_reason
             delta = choice.delta
             if delta and delta.content:
-                content_parts.append(delta.content)
+                text = cls._extract_text_content(delta.content)
+                if text:
+                    content_parts.append(text)
+                thinking_text = cls._extract_thinking_content(delta.content)
+                if thinking_text:
+                    reasoning_parts.append(thinking_text)
             if delta:
                 reasoning = getattr(delta, "reasoning_content", None)
                 if not reasoning:
                     reasoning = getattr(delta, "reasoning", None)
                 if reasoning:
-                    reasoning_parts.append(reasoning)
+                    text = cls._extract_text_content(reasoning)
+                    if text:
+                        reasoning_parts.append(text)
             for tc in (getattr(delta, "tool_calls", None) or []) if delta else []:
                 _accum_tc(tc, getattr(tc, "index", 0))
             if delta:
@@ -1237,19 +1454,24 @@ class OpenAICompatProvider(LLMProvider):
                 b["id"] = _short_tool_id()
             _seen_tc_ids.add(b["id"])
 
+        content = "".join(content_parts) or None
+        tool_calls = [
+            ToolCallRequest(
+                id=b["id"] or _short_tool_id(),
+                name=b["name"],
+                arguments=_coerce_tool_call_args(b["arguments"]),
+                extra_content=b.get("extra_content"),
+                provider_specific_fields=b.get("prov"),
+                function_provider_specific_fields=b.get("fn_prov"),
+            )
+            for b in tc_bufs.values()
+        ]
+        if not tool_calls:
+            content, tool_calls = _extract_text_tool_calls(content)
+
         return LLMResponse(
-            content="".join(content_parts) or None,
-            tool_calls=[
-                ToolCallRequest(
-                    id=b["id"] or _short_tool_id(),
-                    name=b["name"],
-                    arguments=_coerce_tool_call_args(b["arguments"]),
-                    extra_content=b.get("extra_content"),
-                    provider_specific_fields=b.get("prov"),
-                    function_provider_specific_fields=b.get("fn_prov"),
-                )
-                for b in tc_bufs.values()
-            ],
+            content=content,
+            tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
             reasoning_content="".join(reasoning_parts) or None,
@@ -1396,7 +1618,7 @@ class OpenAICompatProvider(LLMProvider):
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         await self._ensure_client()
-        idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
+        idle_timeout_s = resolve_stream_idle_timeout_s()
         try:
             if self._should_use_responses_api(model, reasoning_effort):
                 try:
@@ -1475,8 +1697,13 @@ class OpenAICompatProvider(LLMProvider):
                 chunks.append(chunk)
                 if chunk.choices:
                     delta_obj = chunk.choices[0].delta
+                    raw_delta_content = getattr(delta_obj, "content", None)
                     if on_content_delta:
-                        text = getattr(delta_obj, "content", None)
+                        # Mistral streams content as a list of {"type":"thinking",
+                        # ...} + {"type":"text",...} blocks. Extract just the
+                        # text portion before invoking the callback so callers
+                        # never see non-string content.
+                        text = self._extract_text_content(raw_delta_content)
                         if text:
                             await on_content_delta(text)
                     if on_thinking_delta:
@@ -1484,6 +1711,10 @@ class OpenAICompatProvider(LLMProvider):
                             delta_obj, "reasoning", None,
                         )
                         r_text = self._extract_text_content(reasoning)
+                        if not r_text:
+                            # Mistral keeps the thinking trace inside the
+                            # content array rather than a separate field.
+                            r_text = self._extract_thinking_content(raw_delta_content)
                         if r_text:
                             await on_thinking_delta(r_text)
                     if on_tool_call_delta:
@@ -1513,7 +1744,7 @@ class OpenAICompatProvider(LLMProvider):
             return LLMResponse(
                 content=(
                     f"Error calling LLM: stream stalled for more than "
-                    f"{idle_timeout_s} seconds"
+                    f"{idle_timeout_s:g} seconds"
                 ),
                 finish_reason="error",
                 error_kind="timeout",

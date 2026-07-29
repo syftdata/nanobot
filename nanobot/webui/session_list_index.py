@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from nanobot.cron.session_turns import CRON_HISTORY_META
+from nanobot.config.paths import get_webui_dir
+from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.manager import (
     _SESSION_LIST_PREVIEW_MAX_CHARS,
     _SESSION_LIST_PREVIEW_MAX_RECORDS,
@@ -23,9 +25,14 @@ from nanobot.session.manager import (
     _message_preview_text,
     _metadata_title,
 )
+from nanobot.session.model_selection import model_preset_from_metadata
 
-_INDEX_VERSION = 1
+_INDEX_VERSION = 4
 _INDEX_FILENAME = ".webui_session_index.json"
+_MODEL_PRESET_FIELD = "model_preset"
+_WEBUI_ACTIVITY_MTIME_NS = "webui_activity_mtime_ns"
+_WEBUI_ACTIVITY_SIZE = "webui_activity_size"
+_VISIBLE_TRANSCRIPT_ROLES = {"user", "assistant"}
 
 
 def list_webui_sessions(session_manager: SessionManager) -> list[dict[str, Any]]:
@@ -47,7 +54,11 @@ def _reconcile_index(session_manager: SessionManager) -> tuple[list[dict[str, An
         for row in existing_rows or []
         if isinstance(row.get("file"), str)
     }
-    paths = sorted(session_manager.sessions_dir.glob("*.jsonl"))
+    paths = sorted(
+        path
+        for path in session_manager.sessions_dir.glob("*.jsonl")
+        if SessionManager._session_key_from_path(path) is not None
+    )
     rows: list[dict[str, Any]] = []
     changed = existing_rows is None
 
@@ -117,7 +128,13 @@ def _indexed_row_matches_file(row: dict[str, Any], path: Path) -> bool:
         signature = _file_signature(path)
     except OSError:
         return False
-    return row.get("mtime_ns") == signature["mtime_ns"] and row.get("size") == signature["size"]
+    activity_signature = _webui_activity_signature(str(row.get("key")))
+    return (
+        row.get("mtime_ns") == signature["mtime_ns"]
+        and row.get("size") == signature["size"]
+        and row.get(_WEBUI_ACTIVITY_MTIME_NS) == activity_signature[_WEBUI_ACTIVITY_MTIME_NS]
+        and row.get(_WEBUI_ACTIVITY_SIZE) == activity_signature[_WEBUI_ACTIVITY_SIZE]
+    )
 
 
 def _public_row(sessions_dir: Path, row: dict[str, Any]) -> dict[str, Any]:
@@ -127,6 +144,7 @@ def _public_row(sessions_dir: Path, row: dict[str, Any]) -> dict[str, Any]:
         "updated_at": row.get("updated_at"),
         "title": row.get("title", ""),
         "preview": row.get("preview", ""),
+        _MODEL_PRESET_FIELD: row.get(_MODEL_PRESET_FIELD),
         "path": str(sessions_dir / str(row.get("file", ""))),
     }
 
@@ -143,7 +161,7 @@ def _preview_from_messages(messages: list[dict[str, Any]]) -> str:
             or scanned_chars > _SESSION_LIST_PREVIEW_MAX_CHARS
         ):
             break
-        if item.get(CRON_HISTORY_META) is True:
+        if is_hidden_history_message(item):
             continue
         text = _message_preview_text(item)
         if not text:
@@ -155,22 +173,108 @@ def _preview_from_messages(messages: list[dict[str, Any]]) -> str:
     return fallback_preview
 
 
+def _webui_activity_paths(session_key: str) -> list[Path]:
+    stem = SessionManager.safe_key(session_key)
+    webui_dir = get_webui_dir()
+    return [
+        webui_dir / f"{stem}.jsonl",
+        webui_dir / f"{stem}.json",
+    ]
+
+
+def _webui_activity_signature(session_key: str) -> dict[str, int]:
+    latest_mtime_ns = 0
+    total_size = 0
+    for path in _webui_activity_paths(session_key):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if not path.is_file():
+            continue
+        latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+        total_size += stat.st_size
+    return {
+        _WEBUI_ACTIVITY_MTIME_NS: latest_mtime_ns,
+        _WEBUI_ACTIVITY_SIZE: total_size,
+    }
+
+
+def _webui_activity_updated_at(signature: dict[str, int]) -> str | None:
+    mtime_ns = signature.get(_WEBUI_ACTIVITY_MTIME_NS, 0)
+    if mtime_ns <= 0:
+        return None
+    return datetime.fromtimestamp(mtime_ns / 1_000_000_000).isoformat()
+
+
+def _timestamp(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _latest_updated_at(stored: str | None, activity: str | None) -> str | None:
+    if _timestamp(activity) > _timestamp(stored):
+        return activity
+    return stored
+
+
+def _visible_message_timestamp(item: dict[str, Any]) -> str | None:
+    if is_hidden_history_message(item):
+        return None
+    if item.get("role") not in _VISIBLE_TRANSCRIPT_ROLES:
+        return None
+    timestamp = item.get("timestamp")
+    return timestamp if isinstance(timestamp, str) else None
+
+
+def _last_visible_message_at(messages: list[dict[str, Any]]) -> str | None:
+    latest: str | None = None
+    for item in messages:
+        timestamp = _visible_message_timestamp(item)
+        if timestamp is not None:
+            latest = _latest_updated_at(latest, timestamp)
+    return latest
+
+
+def _visible_activity_updated_at(
+    stored: str | None,
+    visible_message_at: str | None,
+    webui_activity: str | None,
+) -> str | None:
+    return _latest_updated_at(visible_message_at, webui_activity) or stored
+
+
 def _indexed_row_for_session(session: Session, path: Path) -> dict[str, Any]:
     signature = _file_signature(path)
+    activity_signature = _webui_activity_signature(session.key)
+    activity_updated_at = _webui_activity_updated_at(activity_signature)
+    visible_message_at = _last_visible_message_at(session.messages)
     return {
         "key": session.key,
         "created_at": session.created_at.isoformat(),
-        "updated_at": session.updated_at.isoformat(),
+        "updated_at": _visible_activity_updated_at(
+            session.updated_at.isoformat(),
+            visible_message_at,
+            activity_updated_at,
+        ),
         "title": _metadata_title(session.metadata),
         "preview": _preview_from_messages(session.messages),
+        _MODEL_PRESET_FIELD: model_preset_from_metadata(session.metadata),
         "file": path.name,
         "mtime_ns": signature["mtime_ns"],
         "size": signature["size"],
+        **activity_signature,
     }
 
 
 def _scan_session_row(session_manager: SessionManager, path: Path) -> dict[str, Any] | None:
-    fallback_key = path.stem.replace("_", ":", 1)
+    storage_key = SessionManager._session_key_from_path(path)
+    if storage_key is None:
+        return None
     try:
         with open(path, encoding="utf-8") as f:
             first_line = f.readline().strip()
@@ -181,44 +285,67 @@ def _scan_session_row(session_manager: SessionManager, path: Path) -> dict[str, 
                 return None
             preview = ""
             fallback_preview = ""
+            visible_message_at = None
+            preview_done = False
             scanned_records = 0
             scanned_chars = 0
             for line in f:
                 if not line.strip():
                     continue
-                scanned_records += 1
-                scanned_chars += len(line)
-                if (
-                    scanned_records > _SESSION_LIST_PREVIEW_MAX_RECORDS
-                    or scanned_chars > _SESSION_LIST_PREVIEW_MAX_CHARS
-                ):
-                    break
                 item = json.loads(line)
-                if item.get("_type") == "metadata":
-                    continue
-                if item.get(CRON_HISTORY_META) is True:
-                    continue
-                text = _message_preview_text(item)
-                if not text:
-                    continue
-                if item.get("role") == "user":
-                    preview = text
-                    break
-                if not fallback_preview and item.get("role") == "assistant":
-                    fallback_preview = text
+                timestamp = _visible_message_timestamp(item)
+                if timestamp is not None:
+                    visible_message_at = _latest_updated_at(visible_message_at, timestamp)
+                if not preview_done:
+                    scanned_records += 1
+                    scanned_chars += len(line)
+                    if (
+                        scanned_records > _SESSION_LIST_PREVIEW_MAX_RECORDS
+                        or scanned_chars > _SESSION_LIST_PREVIEW_MAX_CHARS
+                    ):
+                        preview_done = True
+                        continue
+                    if item.get("_type") == "metadata":
+                        continue
+                    if is_hidden_history_message(item):
+                        continue
+                    text = _message_preview_text(item)
+                    if not text:
+                        continue
+                    if item.get("role") == "user":
+                        preview = text
+                        preview_done = True
+                        continue
+                    if not fallback_preview and item.get("role") == "assistant":
+                        fallback_preview = text
             signature = _file_signature(path)
+            created_at_s = data.get("created_at")
+            updated_at_s = data.get("updated_at")
+            if not created_at_s or not updated_at_s:
+                fallback_time = datetime.fromtimestamp(signature["mtime_ns"] / 1e9).isoformat()
+                created_at_s = created_at_s or fallback_time
+                updated_at_s = updated_at_s or fallback_time
+            key = data.get("key") or storage_key
+            activity_signature = _webui_activity_signature(key)
+            activity_updated_at = _webui_activity_updated_at(activity_signature)
             return {
-                "key": data.get("key") or fallback_key,
-                "created_at": data.get("created_at"),
-                "updated_at": data.get("updated_at"),
+                "key": key,
+                "created_at": created_at_s,
+                "updated_at": _visible_activity_updated_at(
+                    updated_at_s,
+                    visible_message_at,
+                    activity_updated_at,
+                ),
                 "title": _metadata_title(data.get("metadata", {})),
                 "preview": preview or fallback_preview,
+                _MODEL_PRESET_FIELD: model_preset_from_metadata(data.get("metadata", {})),
                 "file": path.name,
                 "mtime_ns": signature["mtime_ns"],
                 "size": signature["size"],
+                **activity_signature,
             }
     except Exception:
-        repaired = session_manager._repair(fallback_key)
+        repaired = session_manager._repair(storage_key)
         if repaired is None:
             return None
         return _indexed_row_for_session(repaired, path)

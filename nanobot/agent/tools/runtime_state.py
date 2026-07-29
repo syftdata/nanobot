@@ -56,7 +56,15 @@ class RuntimeState(Protocol):
 
     def _sync_subagent_runtime_limits(self) -> None: ...
 
+    def set_runtime_model(self, model: str) -> Any: ...
+
+    def set_runtime_context_window(self, context_window_tokens: int) -> Any: ...
+
+    def set_session_model_preset(
+        self,
+        session_key: str,
+        name: str,
+    ) -> Any: ...
+
     @property
     def model_preset(self) -> str | None: ...
-
-    _active_preset: str | None

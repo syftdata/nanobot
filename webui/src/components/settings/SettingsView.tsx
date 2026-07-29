@@ -3,14 +3,17 @@ import {
   useEffect,
   forwardRef,
   useMemo,
+  useRef,
   useState,
   type Dispatch,
+  type FormEvent,
   type ReactNode,
   type SetStateAction,
 } from "react";
 import {
   Activity,
   ArrowUpCircle,
+  ArrowUpDown,
   Bot,
   Brain,
   Check,
@@ -19,6 +22,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Cloud,
+  Clipboard,
   Cpu,
   Database,
   Eye,
@@ -26,15 +30,19 @@ import {
   ExternalLink,
   Gem,
   Globe2,
+  GripVertical,
   Grid3X3,
   HardDrive,
   Hexagon,
   ImageIcon,
   Layers,
+  ListOrdered,
   Loader2,
   LogOut,
+  MessageCircle,
   Mic,
   Moon,
+  PauseCircle,
   PlayCircle,
   Plus,
   Orbit,
@@ -55,9 +63,22 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { channelUiPresentation } from "@/channel-plugins/registry";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { SkillsCatalogSettings } from "@/components/settings/SkillsCatalogSettings";
 import { TokenUsageHeatmap } from "@/components/settings/TokenUsageHeatmap";
+import { ToggleButton } from "@/components/settings/ToggleButton";
+import {
+  channelIsRunning,
+  channelMatchesFilter,
+  channelSearchText,
+  localizedChannelDisplayName,
+  type ChannelFilter,
+} from "@/components/settings/channels/ChannelIdentity";
+import {
+  ChannelCatalogRow,
+  ChannelSetupPanel,
+} from "@/components/settings/channels/ChannelSetupPanel";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -76,22 +97,37 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { isLoopbackHost } from "@/lib/network";
 import {
   checkVersion,
+  completeProviderOAuth,
   createModelConfiguration,
+  createProviderSettings,
+  deleteModelConfiguration,
+  disableNanobotFeature,
+  enableNanobotFeature,
+  fetchApiService,
+  fetchAutomations,
   fetchSettings,
   fetchSettingsUsage,
   fetchCliApps,
   fetchMcpPresets,
+  fetchNanobotFeatures,
   fetchProviderModels,
   importMcpConfig,
   loginProviderOAuth,
   logoutProviderOAuth,
+  migrateModelConfigurations,
+  runAutomationAction,
   runCliAppAction,
   runMcpPresetAction,
   saveCustomMcpServer,
+  startApiService,
+  stopApiService,
+  updateAutomation,
   updateImageGenerationSettings,
   updateMcpServerTools,
+  updateModelCallOrder,
   updateModelConfiguration,
   updateNetworkSafetySettings,
   updateProviderSettings,
@@ -100,9 +136,23 @@ import {
   updateWebSearchSettings,
 } from "@/lib/api";
 import { notifyCliAppsChanged } from "@/lib/cli-app-events";
-import { getHostApi } from "@/lib/runtime";
-import { notifyMcpPresetsChanged } from "@/lib/mcp-preset-events";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import {
+  readLocalPreferences,
+  writeLocalPreferences,
+  type FileEditDisplayMode,
+  type LocalActivityMode,
+  type LocalDensity,
+  type LocalPreferences,
+} from "@/lib/local-preferences";
+import { getRuntimeHost, isNativeRuntime } from "@/lib/runtime";
+import { notifyMcpPresetsChanged } from "@/lib/mcp-preset-events";
+import { fmtDateTime, relativeTime } from "@/lib/format";
+import { useLogoFallback } from "@/hooks/useLogoFallback";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
+import { usePageVisibility } from "@/hooks/usePageVisibility";
+import {
+  isGenericRepositoryLogoUrl,
   logoFallbackUrls,
   providerBrand,
   providerDisplayLabel,
@@ -111,13 +161,24 @@ import { cn } from "@/lib/utils";
 import { shortWorkspacePath } from "@/lib/workspace";
 import { useClient } from "@/providers/ClientProvider";
 import type {
+  ApiServicePayload,
+  AutomationsPayload,
+  AutomationUpdatePayload,
   CliAppInfo,
   CliAppsPayload,
   ImageGenerationSettingsUpdate,
   McpPresetInfo,
   McpPresetsPayload,
+  NanobotFeatureInfo,
+  NanobotFeaturesPayload,
   NetworkSafetySettingsUpdate,
   ProviderModelsPayload,
+  ProviderOAuthAuthorizationRequired,
+  ProviderOAuthCompletionResult,
+  ProviderOAuthLoginResult,
+  ProviderOAuthPending,
+  ProviderSettingsUpdate,
+  SessionAutomationJob,
   SettingsPayload,
   SkillSummary,
   TranscriptionSettingsUpdate,
@@ -132,41 +193,46 @@ export type SettingsSectionKey =
   | "image"
   | "voice"
   | "browser"
+  | "channels"
   | "apps"
+  | "automations"
   | "skills"
   | "runtime"
   | "advanced";
 
-type LocalDensity = "comfortable" | "compact";
-type LocalActivityMode = "auto" | "expanded";
-type AppsKindFilter = "all" | "cli" | "mcp";
+function isProviderOAuthAuthorizationRequired(
+  payload: ProviderOAuthLoginResult,
+): payload is ProviderOAuthAuthorizationRequired {
+  return (payload as ProviderOAuthAuthorizationRequired).status === "authorization_required";
+}
+
+function isProviderOAuthPending(
+  payload: ProviderOAuthCompletionResult,
+): payload is ProviderOAuthPending {
+  return (payload as ProviderOAuthPending).status === "pending";
+}
+
+type AppsKindFilter = "ready" | "cli" | "mcp";
+type AutomationFilter = "all" | "active" | "paused" | "failed" | "system";
+type AutomationSort = "next" | "last" | "updated" | "name";
+type AutomationAction = "enable" | "disable" | "delete" | "run";
 type AppsCatalogItem =
   | { id: string; kind: "cli"; app: CliAppInfo }
   | { id: string; kind: "mcp"; preset: McpPresetInfo };
-
-interface LocalPreferences {
-  density: LocalDensity;
-  activityMode: LocalActivityMode;
-  codeWrap: boolean;
-  brandLogos: boolean;
-}
 
 interface AgentSettingsDraft {
   model: string;
   provider: string;
   modelPreset: string;
   presetLabel: string;
+  maxTokens: number;
   contextWindowTokens: number;
+  temperature: number;
+  reasoningEffort: string;
   timezone: string;
   botName: string;
   botIcon: string;
   toolHintMaxLength: number;
-}
-
-interface ModelConfigurationDraft {
-  label: string;
-  provider: string;
-  model: string;
 }
 
 type PendingRestartSection = "runtime" | "browser" | "image";
@@ -178,10 +244,35 @@ type RestartAwarePayload = {
   runtime_capabilities?: SettingsPayload["runtime_capabilities"];
 };
 type ProviderApiType = "auto" | "chat_completions" | "responses";
-type ProviderForm = { apiKey: string; apiBase: string; apiType: ProviderApiType };
+type ProviderAdvancedField = NonNullable<
+  SettingsPayload["providers"][number]["advanced_fields"]
+>[number];
+type ProviderForm = {
+  displayName: string;
+  apiKey: string;
+  apiBase: string;
+  apiType: ProviderApiType;
+  proxy: string;
+  extraHeaders: string;
+  extraBody: string;
+  extraQuery: string;
+  thinkingStyle: string;
+  region: string;
+  profile: string;
+};
+type CustomProviderDraft = ProviderForm & { name: string };
 type CustomMcpTransport = "stdio" | "streamableHttp" | "sse";
 
-const CONTEXT_WINDOW_TOKEN_OPTIONS = [65_536, 262_144] as const;
+const CONTEXT_WINDOW_TOKEN_OPTIONS = [65_536, 200_000, 262_144, 500_000, 1_048_576] as const;
+const OAUTH_PROXY_PROVIDERS = new Set(["openai_codex", "xai_grok"]);
+const CUSTOM_PROVIDER_CREATION_KEY = "__custom_provider__";
+const CUSTOM_PROVIDER_ADVANCED_FIELDS: ProviderAdvancedField[] = [
+  "extra_headers",
+  "extra_body",
+  "extra_query",
+  "proxy",
+  "thinking_style",
+];
 const DEFERRED_MODEL_LIST_PROVIDERS = new Set([
   "aihubmix",
   "atomic_chat",
@@ -189,6 +280,7 @@ const DEFERRED_MODEL_LIST_PROVIDERS = new Set([
   "byteplus_coding_plan",
   "huggingface",
   "lm_studio",
+  "modelscope",
   "novita",
   "ollama",
   "openrouter",
@@ -198,7 +290,53 @@ const DEFERRED_MODEL_LIST_PROVIDERS = new Set([
   "volcengine",
   "volcengine_coding_plan",
 ]);
+
+function providerJsonValue(value: Record<string, unknown> | null | undefined): string {
+  return value && Object.keys(value).length > 0 ? JSON.stringify(value, null, 2) : "";
+}
+
+function providerFormFromRow(
+  provider: SettingsPayload["providers"][number],
+): ProviderForm {
+  return {
+    displayName: provider.is_custom ? provider.label : "",
+    apiKey: "",
+    apiBase: provider.api_base ?? provider.default_api_base ?? "",
+    apiType: provider.api_type ?? "auto",
+    proxy: provider.proxy ?? "",
+    extraHeaders: providerJsonValue(provider.extra_headers),
+    extraBody: providerJsonValue(provider.extra_body),
+    extraQuery: providerJsonValue(provider.extra_query),
+    thinkingStyle: provider.thinking_style ?? "",
+    region: provider.region ?? "",
+    profile: provider.profile ?? "",
+  };
+}
+
+function emptyCustomProviderDraft(): CustomProviderDraft {
+  return {
+    name: "",
+    displayName: "",
+    apiKey: "",
+    apiBase: "",
+    apiType: "auto",
+    proxy: "",
+    extraHeaders: "",
+    extraBody: "",
+    extraQuery: "",
+    thinkingStyle: "",
+    region: "",
+    profile: "",
+  };
+}
 const DEFERRED_MODEL_LIST_QUERY_MIN_LENGTH = 2;
+const CLI_APPS_REFRESH_RETRY_MS = 2_000;
+const CLI_APPS_REFRESH_MAX_RETRIES = 30;
+const SETTINGS_SEARCH_INPUT_CLASS = cn(
+  "border-border/45 bg-settings-surface transition-colors hover:border-border/70",
+  "focus-visible:border-border/70 focus-visible:bg-background",
+  "focus-visible:ring-0 focus-visible:ring-offset-0",
+);
 
 const FALLBACK_TIMEZONES = [
   "UTC",
@@ -235,14 +373,6 @@ interface CustomMcpForm {
   toolTimeout: string;
 }
 
-const LOCAL_PREFS_STORAGE_KEY = "nanobot-webui.settings-preferences";
-
-const DEFAULT_LOCAL_PREFS: LocalPreferences = {
-  density: "comfortable",
-  activityMode: "auto",
-  codeWrap: true,
-  brandLogos: true,
-};
 const OPENAI_API_TYPE_OPTIONS: Array<{ value: ProviderApiType; label: string }> = [
   { value: "auto", label: "Auto" },
   { value: "chat_completions", label: "Chat Completions" },
@@ -294,37 +424,16 @@ interface SettingsViewProps {
   hostChromeInset?: boolean;
 }
 
-function readLocalPreferences(): LocalPreferences {
-  try {
-    const raw = window.localStorage.getItem(LOCAL_PREFS_STORAGE_KEY);
-    if (!raw) return DEFAULT_LOCAL_PREFS;
-    const parsed = JSON.parse(raw) as Partial<LocalPreferences>;
-    return {
-      density: parsed.density === "compact" ? "compact" : "comfortable",
-      activityMode: parsed.activityMode === "expanded" ? "expanded" : "auto",
-      codeWrap: parsed.codeWrap !== false,
-      brandLogos: parsed.brandLogos !== false,
-    };
-  } catch {
-    return DEFAULT_LOCAL_PREFS;
-  }
-}
-
 function modelPresetValue(payload: SettingsPayload): string {
-  return payload.agent.model_preset || "default";
-}
-
-function defaultPreset(payload: SettingsPayload): SettingsPayload["model_presets"][number] | null {
-  return payload.model_presets.find((preset) => preset.is_default) ?? null;
+  return (
+    payload.model_call_order?.[0] ??
+    payload.model_presets.find((preset) => !preset.is_default)?.name ??
+    ""
+  );
 }
 
 function normalizeContextWindowTokens(value: number | null | undefined): number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 65_536;
-}
-
-function editableDefaultProvider(payload: SettingsPayload): string {
-  const base = defaultPreset(payload);
-  return base?.provider ?? payload.agent.provider ?? payload.agent.resolved_provider ?? "";
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 200_000;
 }
 
 function settingsProviderRow(
@@ -338,13 +447,14 @@ function settingsProviderRow(
 function settingsProviderConfigured(
   payload: SettingsPayload,
   provider: string | null | undefined,
+  resolvedProvider?: string | null,
 ): boolean {
   const row = settingsProviderRow(payload, provider);
   if (row) return row.configured;
   if (provider === "auto") {
     const resolvedRow = settingsProviderRow(
       payload,
-      payload.agent.resolved_provider ?? payload.agent.provider,
+      resolvedProvider ?? payload.agent.resolved_provider ?? payload.agent.provider,
     );
     if (resolvedRow) return resolvedRow.configured;
   }
@@ -354,9 +464,12 @@ function settingsProviderConfigured(
 const DEFAULT_AGENT_SETTINGS_DRAFT: AgentSettingsDraft = {
   model: "",
   provider: "",
-  modelPreset: "default",
-  presetLabel: "Default",
-  contextWindowTokens: 65_536,
+  modelPreset: "",
+  presetLabel: "",
+  maxTokens: 8192,
+  contextWindowTokens: 200_000,
+  temperature: 0.1,
+  reasoningEffort: "",
   timezone: "UTC",
   botName: "nanobot",
   botIcon: "",
@@ -406,21 +519,26 @@ const DEFAULT_NETWORK_SAFETY_FORM: NetworkSafetySettingsUpdate = {
   webuiDefaultAccessMode: "default",
 };
 
-function agentDraftFromPayload(payload: SettingsPayload): AgentSettingsDraft {
-  const fallbackDefault = defaultPreset(payload);
-  const activePresetName = modelPresetValue(payload);
+function agentDraftFromPayload(
+  payload: SettingsPayload,
+  preferredPresetName?: string,
+): AgentSettingsDraft {
+  const activePresetName = preferredPresetName ?? modelPresetValue(payload);
   const activePreset =
-    payload.model_presets.find((preset) => preset.name === activePresetName) ?? fallbackDefault;
+    payload.model_presets.find(
+      (preset) => !preset.is_default && preset.name === activePresetName,
+    ) ?? null;
   return {
     model: activePreset?.model ?? payload.agent.model,
-    provider: activePreset?.is_default
-      ? editableDefaultProvider(payload)
-      : activePreset?.provider ?? editableDefaultProvider(payload),
+    provider: activePreset?.provider ?? payload.agent.provider ?? payload.agent.resolved_provider ?? "",
     modelPreset: activePresetName,
     presetLabel: activePreset?.label ?? activePresetName,
+    maxTokens: activePreset?.max_tokens ?? payload.agent.max_tokens,
     contextWindowTokens: normalizeContextWindowTokens(
       activePreset?.context_window_tokens ?? payload.agent.context_window_tokens,
     ),
+    temperature: activePreset?.temperature ?? payload.agent.temperature,
+    reasoningEffort: activePreset?.reasoning_effort ?? "",
     timezone: payload.agent.timezone,
     botName: payload.agent.bot_name,
     botIcon: payload.agent.bot_icon,
@@ -440,6 +558,16 @@ function webSearchFormFromPayload(
     timeout: payload.web_search.timeout,
     useJinaReader: payload.web.fetch.use_jina_reader,
   };
+}
+
+type WebSearchProviderOption = SettingsPayload["web_search"]["providers"][number];
+
+function webSearchProviderAcceptsApiKey(provider?: WebSearchProviderOption): boolean {
+  return provider?.credential === "api_key" || provider?.credential === "optional_api_key";
+}
+
+function webSearchProviderRequiresApiKey(provider?: WebSearchProviderOption): boolean {
+  return provider?.credential === "api_key";
 }
 
 function imageGenerationFormFromPayload(payload: SettingsPayload): ImageGenerationSettingsUpdate {
@@ -506,39 +634,68 @@ export function SettingsView({
 }: SettingsViewProps) {
   const { t } = useTranslation();
   const { token } = useClient();
+  const pageVisible = usePageVisibility();
+  const remoteBrowserAccess =
+    typeof window !== "undefined" && !isLoopbackHost(window.location.hostname);
   const [settings, setSettings] = useState<SettingsPayload | null>(() => initialSettings);
   const [cliApps, setCliApps] = useState<CliAppsPayload | null>(null);
+  const [nanobotFeatures, setNanobotFeatures] = useState<NanobotFeaturesPayload | null>(null);
+  const featureCatalog = nanobotFeatures?.features ?? [];
   const [mcpPresets, setMcpPresets] = useState<McpPresetsPayload | null>(null);
+  const [automations, setAutomations] = useState<AutomationsPayload | null>(null);
   const [loading, setLoading] = useState(() => initialSettings === null);
   const [cliAppsLoading, setCliAppsLoading] = useState(true);
+  const [nanobotFeaturesLoading, setNanobotFeaturesLoading] = useState(true);
   const [mcpPresetsLoading, setMcpPresetsLoading] = useState(true);
+  const [automationsLoading, setAutomationsLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [modelConfigurationOpen, setModelConfigurationOpen] = useState(false);
+  const [modelPresetCreating, setModelPresetCreating] = useState(false);
   const [modelConfigurationSaving, setModelConfigurationSaving] = useState(false);
-  const [modelConfigurationForm, setModelConfigurationForm] = useState<ModelConfigurationDraft>({
-    label: "",
-    provider: "",
-    model: "",
-  });
+  const [modelCallOrderSaving, setModelCallOrderSaving] = useState(false);
+  const [modelMigrationSaving, setModelMigrationSaving] = useState(false);
+  const [modelPresetPendingDelete, setModelPresetPendingDelete] =
+    useState<SettingsPayload["model_presets"][number] | null>(null);
+  const modelPresetBeforeCreateRef = useRef<string | null>(null);
   const [cliAppsAction, setCliAppsAction] = useState<string | null>(null);
+  const [nanobotFeatureAction, setNanobotFeatureAction] = useState<string | null>(null);
+  const [nanobotFeatureConfirm, setNanobotFeatureConfirm] = useState<NanobotFeatureInfo | null>(null);
   const [mcpPresetAction, setMcpPresetAction] = useState<string | null>(null);
   const [providerSaving, setProviderSaving] = useState<string | null>(null);
+  const [xaiOAuthFlow, setXaiOAuthFlow] =
+    useState<ProviderOAuthAuthorizationRequired | null>(null);
+  const xaiOAuthFlowRef = useRef<ProviderOAuthAuthorizationRequired | null>(null);
+  const [xaiOAuthCode, setXaiOAuthCode] = useState("");
+  const [xaiOAuthCompleting, setXaiOAuthCompleting] = useState(false);
   const [webSearchSaving, setWebSearchSaving] = useState(false);
   const [imageGenerationSaving, setImageGenerationSaving] = useState(false);
   const [transcriptionSaving, setTranscriptionSaving] = useState(false);
   const [networkSafetySaving, setNetworkSafetySaving] = useState(false);
+  const [apiService, setApiService] = useState<ApiServicePayload | null>(null);
+  const [apiServiceLoading, setApiServiceLoading] = useState(false);
+  const [apiServiceAction, setApiServiceAction] = useState<"start" | "stop" | null>(null);
+  const [apiServiceError, setApiServiceError] = useState<string | null>(null);
   const [hostEngineApplying, setHostEngineApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<SettingsSectionKey>(initialSection);
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
-  const [providerQuery, setProviderQuery] = useState("");
   const [appsQuery, setAppsQuery] = useState("");
+  const [channelsQuery, setChannelsQuery] = useState("");
+  const [automationsQuery, setAutomationsQuery] = useState("");
+  const [automationsFilter, setAutomationsFilter] = useState<AutomationFilter>("all");
+  const [automationsSort, setAutomationsSort] = useState<AutomationSort>("next");
   const [cliAppsMessage, setCliAppsMessage] = useState<string | null>(null);
   const [cliAppsError, setCliAppsError] = useState<string | null>(null);
+  const [nanobotFeaturesError, setNanobotFeaturesError] = useState<string | null>(null);
   const [cliAppsFocusName, setCliAppsFocusName] = useState<string | null>(null);
-  const [appsKindFilter, setAppsKindFilter] = useState<AppsKindFilter>("all");
+  const [appsKindFilter, setAppsKindFilter] = useState<AppsKindFilter>("cli");
   const [mcpMessage, setMcpMessage] = useState<string | null>(null);
   const [mcpError, setMcpError] = useState<string | null>(null);
+  const [automationsError, setAutomationsError] = useState<string | null>(null);
+  const [automationAction, setAutomationAction] = useState<string | null>(null);
+  const [automationPendingDelete, setAutomationPendingDelete] =
+    useState<SessionAutomationJob | null>(null);
+  const [automationPendingEdit, setAutomationPendingEdit] =
+    useState<SessionAutomationJob | null>(null);
   const [mcpFieldValues, setMcpFieldValues] = useState<Record<string, Record<string, string>>>({});
   const [customMcpForm, setCustomMcpForm] = useState<CustomMcpForm>(DEFAULT_CUSTOM_MCP_FORM);
   const [mcpConfigImport, setMcpConfigImport] = useState("");
@@ -581,25 +738,72 @@ export function SettingsView({
   const [form, setForm] = useState<AgentSettingsDraft>(() =>
     initialSettings ? agentDraftFromPayload(initialSettings) : DEFAULT_AGENT_SETTINGS_DRAFT,
   );
-
-  const text = useCallback(
-    (key: string, fallback: string, options?: Record<string, unknown>) =>
-      t(key, { defaultValue: fallback, ...(options ?? {}) }),
-    [t],
+  const [modelCallOrder, setModelCallOrder] = useState<string[]>(
+    () => initialSettings?.model_call_order ?? [],
   );
 
-  const applyPayload = useCallback((payload: SettingsPayload) => {
-    setSettings(payload);
-    setForm(agentDraftFromPayload(payload));
-    setWebSearchForm((prev) => webSearchFormFromPayload(payload, prev));
-    setImageGenerationForm(imageGenerationFormFromPayload(payload));
-    setTranscriptionForm(transcriptionFormFromPayload(payload));
-    setNetworkSafetyForm(networkSafetyFormFromPayload(payload));
-    if (payload.restart_required_sections) {
-      setPendingRestartSections(pendingRestartSectionsFromPayload(payload));
-    }
-    onSettingsChange?.(payload);
-  }, [onSettingsChange]);
+  const applyPayload = useCallback(
+    (
+      payload: SettingsPayload,
+      options: { preserveAgentForm?: boolean } = {},
+    ) => {
+      setSettings(payload);
+      if (!options.preserveAgentForm) {
+        setForm(agentDraftFromPayload(payload));
+        setModelPresetCreating(false);
+      }
+      setModelCallOrder(payload.model_call_order ?? []);
+      setWebSearchForm((prev) => webSearchFormFromPayload(payload, prev));
+      setImageGenerationForm(imageGenerationFormFromPayload(payload));
+      setTranscriptionForm(transcriptionFormFromPayload(payload));
+      setNetworkSafetyForm(networkSafetyFormFromPayload(payload));
+      if (payload.restart_required_sections) {
+        setPendingRestartSections(pendingRestartSectionsFromPayload(payload));
+      }
+      onSettingsChange?.(payload);
+    },
+    [onSettingsChange],
+  );
+
+  const closeXaiOAuthFlow = useCallback(() => {
+    xaiOAuthFlowRef.current = null;
+    setXaiOAuthFlow(null);
+    setXaiOAuthCode("");
+    setXaiOAuthCompleting(false);
+  }, []);
+
+  useEffect(() => {
+    if (!xaiOAuthFlow) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const poll = async () => {
+      try {
+        const payload = await completeProviderOAuth(
+          token,
+          xaiOAuthFlow.provider,
+          xaiOAuthFlow.flow_id,
+        );
+        if (cancelled || xaiOAuthFlowRef.current?.flow_id !== xaiOAuthFlow.flow_id) return;
+        if (isProviderOAuthPending(payload)) {
+          timer = window.setTimeout(() => void poll(), 1000);
+          return;
+        }
+        applyPayload(payload);
+        setExpandedProvider(xaiOAuthFlow.provider);
+        setError(null);
+        closeXaiOAuthFlow();
+      } catch (err) {
+        if (cancelled || xaiOAuthFlowRef.current?.flow_id !== xaiOAuthFlow.flow_id) return;
+        setError((err as Error).message);
+        closeXaiOAuthFlow();
+      }
+    };
+    timer = window.setTimeout(() => void poll(), 1000);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [applyPayload, closeXaiOAuthFlow, token, xaiOAuthFlow]);
 
   useEffect(() => {
     if (!initialSettings || settings !== null) return;
@@ -631,7 +835,7 @@ export function SettingsView({
 
   const hasSettings = settings !== null;
   useEffect(() => {
-    if (activeSection !== "overview" || !hasSettings) return;
+    if (activeSection !== "overview" || !hasSettings || !pageVisible) return;
     let cancelled = false;
     const refresh = () => {
       fetchSettingsUsage(token)
@@ -644,35 +848,102 @@ export function SettingsView({
     void refresh();
     const interval = window.setInterval(refresh, 5000);
     const onFocus = () => refresh();
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") refresh();
-    };
     window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       cancelled = true;
       window.clearInterval(interval);
       window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [activeSection, hasSettings, token]);
+  }, [activeSection, hasSettings, pageVisible, token]);
 
   useEffect(() => {
     if (activeSection !== "apps") return;
     let cancelled = false;
-    setCliAppsLoading(true);
-    fetchCliApps(token)
-      .then((payload) => {
-        if (!cancelled) {
+    let retry: number | null = null;
+    let retryCount = 0;
+    const loadCliApps = (showLoading: boolean) => {
+      if (showLoading) setCliAppsLoading(true);
+      fetchCliApps(token)
+        .then((payload) => {
+          if (cancelled) return;
+          if (payload.catalog_refresh_pending && retryCount < CLI_APPS_REFRESH_MAX_RETRIES) {
+            retryCount += 1;
+            retry = window.setTimeout(() => {
+              retry = null;
+              loadCliApps(false);
+            }, CLI_APPS_REFRESH_RETRY_MS);
+          }
           setCliApps(payload);
           setCliAppsError(null);
+          setCliAppsLoading(false);
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            setCliAppsError((err as Error).message);
+            setCliAppsLoading(false);
+          }
+        });
+    };
+    loadCliApps(true);
+    return () => {
+      cancelled = true;
+      if (retry !== null) window.clearTimeout(retry);
+    };
+  }, [activeSection, token]);
+
+  useEffect(() => {
+    if (!["channels", "models", "browser", "runtime"].includes(activeSection)) return;
+    let cancelled = false;
+    const refresh = async (showLoading = false) => {
+      if (showLoading) setNanobotFeaturesLoading(true);
+      try {
+        const payload = await fetchNanobotFeatures(token);
+        if (!cancelled) {
+          setNanobotFeatures(payload);
+          setNanobotFeaturesError(null);
+        }
+      } catch (err) {
+        const message = (err as Error).message;
+        if (!cancelled && message !== "HTTP 404") setNanobotFeaturesError(message);
+      } finally {
+        if (!cancelled && showLoading) setNanobotFeaturesLoading(false);
+      }
+    };
+    void refresh(true);
+    const interval = activeSection === "channels"
+      ? window.setInterval(() => void refresh(false), 5000)
+      : null;
+    const refreshOnFocus = () => {
+      if (activeSection === "channels" && document.visibilityState !== "hidden") {
+        void refresh(false);
+      }
+    };
+    window.addEventListener("focus", refreshOnFocus);
+    document.addEventListener("visibilitychange", refreshOnFocus);
+    return () => {
+      cancelled = true;
+      if (interval !== null) window.clearInterval(interval);
+      window.removeEventListener("focus", refreshOnFocus);
+      document.removeEventListener("visibilitychange", refreshOnFocus);
+    };
+  }, [activeSection, token]);
+
+  useEffect(() => {
+    if (activeSection !== "runtime") return;
+    let cancelled = false;
+    setApiServiceLoading(true);
+    fetchApiService(token)
+      .then((payload) => {
+        if (!cancelled) {
+          setApiService(payload);
+          setApiServiceError(null);
         }
       })
       .catch((err) => {
-        if (!cancelled) setCliAppsError((err as Error).message);
+        if (!cancelled) setApiServiceError((err as Error).message);
       })
       .finally(() => {
-        if (!cancelled) setCliAppsLoading(false);
+        if (!cancelled) setApiServiceLoading(false);
       });
     return () => {
       cancelled = true;
@@ -701,12 +972,52 @@ export function SettingsView({
     };
   }, [activeSection, token]);
 
+  const refreshAutomations = useCallback(
+    async (showLoading = false) => {
+      if (showLoading) setAutomationsLoading(true);
+      try {
+        const payload = await fetchAutomations(token);
+        setAutomations(payload);
+        setAutomationsError(null);
+      } catch (err) {
+        setAutomationsError((err as Error).message);
+      } finally {
+        if (showLoading) setAutomationsLoading(false);
+      }
+    },
+    [token],
+  );
+
   useEffect(() => {
-    try {
-      window.localStorage.setItem(LOCAL_PREFS_STORAGE_KEY, JSON.stringify(localPrefs));
-    } catch {
-      // Browser-only preferences should never block settings.
-    }
+    if (activeSection !== "automations" || !pageVisible) return;
+    let cancelled = false;
+    const refresh = async (showLoading = false) => {
+      if (cancelled) return;
+      if (showLoading) setAutomationsLoading(true);
+      try {
+        const payload = await fetchAutomations(token);
+        if (cancelled) return;
+        setAutomations(payload);
+        setAutomationsError(null);
+      } catch (err) {
+        if (!cancelled) setAutomationsError((err as Error).message);
+      } finally {
+        if (!cancelled && showLoading) setAutomationsLoading(false);
+      }
+    };
+    void refresh(true);
+    const interval = window.setInterval(() => void refresh(false), 5000);
+    const refreshOnFocus = () => void refresh(false);
+    window.addEventListener("focus", refreshOnFocus);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refreshOnFocus);
+    };
+  }, [activeSection, pageVisible, token]);
+
+  useEffect(() => {
+    writeLocalPreferences(localPrefs);
   }, [localPrefs]);
 
   useEffect(() => {
@@ -714,11 +1025,7 @@ export function SettingsView({
     setProviderForms((prev) => {
       const next = { ...prev };
       for (const provider of settings.providers) {
-        next[provider.name] = {
-          apiKey: next[provider.name]?.apiKey ?? "",
-          apiBase: next[provider.name]?.apiBase ?? provider.api_base ?? provider.default_api_base ?? "",
-          apiType: next[provider.name]?.apiType ?? provider.api_type ?? "auto",
-        };
+        next[provider.name] = next[provider.name] ?? providerFormFromRow(provider);
       }
       return next;
     });
@@ -726,18 +1033,18 @@ export function SettingsView({
 
   const modelDirty = useMemo(() => {
     if (!settings) return false;
-    const activePresetName = modelPresetValue(settings);
-    const selectedPreset = settings.model_presets.find((preset) => preset.name === form.modelPreset);
-    if (!selectedPreset) return form.modelPreset !== activePresetName;
-    const selectedProvider = selectedPreset.is_default
-      ? editableDefaultProvider(settings)
-      : selectedPreset.provider;
+    const selectedPreset = settings.model_presets.find(
+      (preset) => !preset.is_default && preset.name === form.modelPreset,
+    );
+    if (!selectedPreset) return false;
     return (
-      form.modelPreset !== activePresetName ||
       form.model !== selectedPreset.model ||
-      form.provider !== selectedProvider ||
+      form.provider !== selectedPreset.provider ||
+      form.maxTokens !== selectedPreset.max_tokens ||
       form.contextWindowTokens !== normalizeContextWindowTokens(selectedPreset.context_window_tokens) ||
-      (!selectedPreset.is_default && form.presetLabel.trim() !== selectedPreset.label)
+      form.temperature !== selectedPreset.temperature ||
+      form.reasoningEffort !== (selectedPreset.reasoning_effort ?? "") ||
+      form.presetLabel.trim() !== selectedPreset.label
     );
   }, [form, settings]);
 
@@ -857,37 +1164,98 @@ export function SettingsView({
   );
 
   const saveModelSettings = async () => {
-    if (!settings || !modelDirty || saving) return;
+    if (
+      !settings ||
+      saving ||
+      modelCallOrderSaving ||
+      modelConfigurationSaving
+    ) {
+      return;
+    }
+
+    if (modelPresetCreating) {
+      const label = form.presetLabel.trim();
+      const provider = form.provider.trim();
+      const model = form.model.trim();
+      if (
+        !label ||
+        !provider ||
+        !model ||
+        form.maxTokens <= 0 ||
+        form.contextWindowTokens <= 0 ||
+        form.temperature < 0 ||
+        form.temperature > 2
+      ) {
+        return;
+      }
+      setModelConfigurationSaving(true);
+      try {
+        const payload = await createModelConfiguration(token, {
+          label,
+          provider,
+          model,
+          maxTokens: form.maxTokens,
+          contextWindowTokens: form.contextWindowTokens,
+          temperature: form.temperature,
+          reasoningEffort: form.reasoningEffort || null,
+        });
+        const createdPreset = payload.created_model_preset;
+        const nextOrder = createdPreset ? [...modelCallOrder, createdPreset] : null;
+        applyPayload(payload);
+        if (createdPreset) {
+          setForm(agentDraftFromPayload(payload, createdPreset));
+        }
+
+        let finalPayload = payload;
+        if (nextOrder) {
+          const orderedPayload = await updateModelCallOrder(token, nextOrder);
+          applyPayload(orderedPayload);
+          finalPayload = orderedPayload;
+        }
+        if (createdPreset) {
+          setForm(agentDraftFromPayload(finalPayload, createdPreset));
+        }
+        modelPresetBeforeCreateRef.current = null;
+        onModelNameChange(finalPayload.agent.model || null);
+        setError(null);
+      } catch (err) {
+        setError((err as Error).message);
+      } finally {
+        setModelConfigurationSaving(false);
+      }
+      return;
+    }
+
+    if (!modelDirty) return;
+    const selectedPreset = settings.model_presets.find(
+      (preset) => !preset.is_default && preset.name === form.modelPreset,
+    );
+    if (!selectedPreset) return;
+    const reasoningEffort = form.reasoningEffort || null;
     setSaving(true);
     try {
-      const selectedPreset = settings.model_presets.find((preset) => preset.name === form.modelPreset);
-      let payload: SettingsPayload;
-      if (selectedPreset && !selectedPreset.is_default) {
-        payload = await updateModelConfiguration(token, {
-          name: selectedPreset.name,
-          label: form.presetLabel.trim(),
-          model: form.model,
-          provider: form.provider,
-          ...(form.contextWindowTokens !== selectedPreset.context_window_tokens
-            ? { contextWindowTokens: form.contextWindowTokens }
-            : {}),
-        });
-      } else {
-        const defaultModel = defaultPreset(settings)?.model ?? settings.agent.model;
-        const defaultProvider = editableDefaultProvider(settings);
-        const defaultContextWindowTokens = normalizeContextWindowTokens(
-          defaultPreset(settings)?.context_window_tokens ?? settings.agent.context_window_tokens,
-        );
-        payload = await updateSettings(token, {
-          modelPreset: form.modelPreset,
-          ...(form.model !== defaultModel ? { model: form.model } : {}),
-          ...(form.provider !== defaultProvider ? { provider: form.provider } : {}),
-          ...(form.contextWindowTokens !== defaultContextWindowTokens
-            ? { contextWindowTokens: form.contextWindowTokens }
-            : {}),
-        });
-      }
+      const payload = await updateModelConfiguration(token, {
+        name: selectedPreset.name,
+        label:
+          form.presetLabel.trim() !== selectedPreset.label
+            ? form.presetLabel.trim()
+            : undefined,
+        model: form.model !== selectedPreset.model ? form.model : undefined,
+        provider: form.provider !== selectedPreset.provider ? form.provider : undefined,
+        maxTokens:
+          form.maxTokens !== selectedPreset.max_tokens ? form.maxTokens : undefined,
+        contextWindowTokens:
+          form.contextWindowTokens !==
+          normalizeContextWindowTokens(selectedPreset.context_window_tokens)
+            ? form.contextWindowTokens
+            : undefined,
+        temperature:
+          form.temperature !== selectedPreset.temperature ? form.temperature : undefined,
+        reasoningEffort:
+          reasoningEffort !== selectedPreset.reasoning_effort ? reasoningEffort : undefined,
+      });
       applyPayload(payload);
+      setForm(agentDraftFromPayload(payload, selectedPreset.name));
       onModelNameChange(payload.agent.model || null);
       setError(null);
     } catch (err) {
@@ -897,42 +1265,107 @@ export function SettingsView({
     }
   };
 
-  const openModelConfigurationDialog = () => {
-    if (!settings) return;
-    const currentProvider = settings.agent.provider;
+  const beginModelPresetCreation = () => {
+    if (!settings || saving || modelCallOrderSaving || modelConfigurationSaving) return;
+    const primaryPreset = settings.model_presets.find(
+      (preset) => !preset.is_default && preset.name === settings.model_call_order?.[0],
+    );
+    const currentProvider = primaryPreset?.provider === "auto"
+      ? primaryPreset.resolved_provider ?? settings.agent.resolved_provider
+      : primaryPreset?.provider ?? settings.agent.provider;
     const provider =
       configuredModelProviderOptions.find((option) => option.name === currentProvider)?.name ??
       configuredModelProviderOptions[0]?.name ??
       "";
-    setModelConfigurationForm({
-      label: "",
+    modelPresetBeforeCreateRef.current = form.modelPreset;
+    setForm((prev) => ({
+      ...prev,
+      modelPreset: "",
+      presetLabel: "",
       provider,
       model: "",
-    });
-    setModelConfigurationOpen(true);
+      maxTokens: primaryPreset?.max_tokens ?? settings.agent.max_tokens,
+      contextWindowTokens: normalizeContextWindowTokens(
+        primaryPreset?.context_window_tokens ?? settings.agent.context_window_tokens,
+      ),
+      temperature: primaryPreset?.temperature ?? settings.agent.temperature,
+      reasoningEffort: primaryPreset?.reasoning_effort ?? settings.agent.reasoning_effort ?? "",
+    }));
+    setModelPresetCreating(true);
   };
 
-  const handleCreateModelConfiguration = async () => {
-    if (modelConfigurationSaving) return;
-    const label = modelConfigurationForm.label.trim();
-    const provider = modelConfigurationForm.provider.trim();
-    const model = modelConfigurationForm.model.trim();
-    if (!label || !provider || !model) return;
-    setModelConfigurationSaving(true);
+  const cancelModelPresetCreation = () => {
+    if (!settings || modelConfigurationSaving) return;
+    const previousPreset = modelPresetBeforeCreateRef.current;
+    setModelPresetCreating(false);
+    setForm(agentDraftFromPayload(settings, previousPreset ?? undefined));
+    modelPresetBeforeCreateRef.current = null;
+  };
+
+  const changeModelCallOrder = async (nextOrder: string[]) => {
+    const unchanged =
+      nextOrder.length === modelCallOrder.length &&
+      nextOrder.every((name, index) => name === modelCallOrder[index]);
+    if (
+      !settings ||
+      saving ||
+      modelCallOrderSaving ||
+      modelConfigurationSaving ||
+      nextOrder.length === 0 ||
+      unchanged
+    ) {
+      return;
+    }
+    const previousOrder = [...modelCallOrder];
+    setModelCallOrder(nextOrder);
+    setModelCallOrderSaving(true);
     try {
-      const payload = await createModelConfiguration(token, {
-        label,
-        provider,
-        model,
-      });
+      const payload = await updateModelCallOrder(token, nextOrder);
+      applyPayload(payload, { preserveAgentForm: true });
+      onModelNameChange(payload.agent.model || null);
+      setError(null);
+    } catch (err) {
+      setModelCallOrder(previousOrder);
+      setError((err as Error).message);
+    } finally {
+      setModelCallOrderSaving(false);
+    }
+  };
+
+  const handleMigrateModelConfigurations = async () => {
+    if (modelMigrationSaving) return;
+    setModelMigrationSaving(true);
+    try {
+      const payload = await migrateModelConfigurations(token);
       applyPayload(payload);
       onModelNameChange(payload.agent.model || null);
-      setModelConfigurationOpen(false);
       setError(null);
     } catch (err) {
       setError((err as Error).message);
     } finally {
-      setModelConfigurationSaving(false);
+      setModelMigrationSaving(false);
+    }
+  };
+
+  const handleDeleteModelConfiguration = async () => {
+    if (
+      !modelPresetPendingDelete ||
+      saving ||
+      modelCallOrderSaving ||
+      modelConfigurationSaving
+    ) {
+      return;
+    }
+    setSaving(true);
+    try {
+      const payload = await deleteModelConfiguration(token, modelPresetPendingDelete.name);
+      applyPayload(payload);
+      setModelPresetPendingDelete(null);
+      setError(null);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -1013,26 +1446,95 @@ export function SettingsView({
     }
   };
 
+  const installCapabilities = async (names: string[]): Promise<boolean> => {
+    const missing = names.filter(
+      (name) => !featureCatalog.find((feature) => feature.name === name)?.installed,
+    );
+    if (!missing.length) return true;
+    setNanobotFeatureAction(`enable:${names.join("+")}`);
+    setNanobotFeaturesError(null);
+    try {
+      let latest = nanobotFeatures;
+      for (const name of missing) {
+        latest = await enableNanobotFeature(token, name);
+        if (latest.requires_restart) {
+          setPendingRestartSections((prev) => ({ ...prev, runtime: true }));
+        }
+      }
+      if (latest) setNanobotFeatures(latest);
+      return true;
+    } catch (err) {
+      setNanobotFeaturesError((err as Error).message);
+      return false;
+    } finally {
+      setNanobotFeatureAction(null);
+    }
+  };
+
+  const handleApiServiceAction = async (
+    action: "start" | "stop",
+    values?: { host: string; port: number; timeout: number; apiKey?: string },
+  ) => {
+    if (apiServiceAction) return;
+    setApiServiceAction(action);
+    setApiServiceError(null);
+    try {
+      const payload = action === "start"
+        ? await startApiService(token, values!)
+        : await stopApiService(token);
+      setApiService(payload);
+      const refreshed = await fetchNanobotFeatures(token);
+      setNanobotFeatures(refreshed);
+      const nextSettings = await fetchSettings(token);
+      applyPayload(nextSettings);
+    } catch (err) {
+      setApiServiceError((err as Error).message);
+    } finally {
+      setApiServiceAction(null);
+    }
+  };
+
   const saveProvider = async (providerName: string) => {
     if (providerSaving) return;
     const provider = settings?.providers.find((item) => item.name === providerName);
     if (!provider) return;
-    if (provider.auth_type === "oauth") return;
-    const providerForm = providerForms[providerName] ?? { apiKey: "", apiBase: "", apiType: "auto" };
+    const isOauthProvider = provider.auth_type === "oauth";
+    const providerForm = providerForms[providerName] ?? providerFormFromRow(provider);
     const apiKey = providerForm.apiKey.trim();
     const apiKeyRequired = provider.api_key_required ?? true;
-    if (!provider.configured && apiKeyRequired && !apiKey) {
+    if (!isOauthProvider && !provider.configured && apiKeyRequired && !apiKey) {
       setError(t("settings.byok.apiKeyRequired"));
       return;
     }
     setProviderSaving(providerName);
     try {
-      const payload = await updateProviderSettings(token, {
-        provider: providerName,
-        apiKey: apiKey || undefined,
-        apiBase: providerForm.apiBase.trim(),
-        apiType: providerForm.apiType,
-      });
+      const supportName = providerName === "bedrock"
+        ? "bedrock"
+        : providerName === "azure_openai"
+          ? "azure"
+          : null;
+      if (supportName && !(await installCapabilities([supportName]))) return;
+      const update: ProviderSettingsUpdate = { provider: providerName };
+      if (!isOauthProvider) {
+        update.apiKey = apiKey || undefined;
+        update.apiBase = providerForm.apiBase.trim();
+        if (provider.is_custom) update.displayName = providerForm.displayName.trim();
+      }
+      for (const field of provider.advanced_fields ?? []) {
+        if (field === "api_type") update.apiType = providerForm.apiType;
+        if (field === "proxy") update.proxy = providerForm.proxy.trim();
+        if (field === "extra_headers") {
+          update.extraHeaders = providerForm.extraHeaders.trim();
+        }
+        if (field === "extra_body") update.extraBody = providerForm.extraBody.trim();
+        if (field === "extra_query") update.extraQuery = providerForm.extraQuery.trim();
+        if (field === "thinking_style") {
+          update.thinkingStyle = providerForm.thinkingStyle.trim();
+        }
+        if (field === "region") update.region = providerForm.region.trim();
+        if (field === "profile") update.profile = providerForm.profile.trim();
+      }
+      const payload = await updateProviderSettings(token, update);
       applyPayload(payload);
       if (payload.requires_restart) {
         setPendingRestartSections((prev) => ({ ...prev, image: true }));
@@ -1041,13 +1543,19 @@ export function SettingsView({
       setProviderForms((prev) => ({
         ...prev,
         [providerName]: {
+          ...providerForm,
+          displayName: providerForm.displayName.trim(),
           apiKey: "",
           apiBase: providerForm.apiBase.trim(),
-          apiType: providerForm.apiType,
+          proxy: providerForm.proxy.trim(),
+          thinkingStyle: providerForm.thinkingStyle.trim(),
+          region: providerForm.region.trim(),
+          profile: providerForm.profile.trim(),
         },
       }));
       setVisibleProviderKeys((prev) => ({ ...prev, [providerName]: false }));
       setEditingProviderKeys((prev) => ({ ...prev, [providerName]: false }));
+      if (!isOauthProvider) setExpandedProvider(null);
       setError(null);
     } catch (err) {
       setError((err as Error).message);
@@ -1056,21 +1564,100 @@ export function SettingsView({
     }
   };
 
+  const createCustomProvider = async (draft: CustomProviderDraft): Promise<boolean> => {
+    if (providerSaving) return false;
+    setProviderSaving(CUSTOM_PROVIDER_CREATION_KEY);
+    try {
+      const payload = await createProviderSettings(token, {
+        name: draft.name.trim(),
+        apiKey: draft.apiKey.trim() || undefined,
+        apiBase: draft.apiBase.trim(),
+        proxy: draft.proxy.trim(),
+        extraHeaders: draft.extraHeaders.trim(),
+        extraBody: draft.extraBody.trim(),
+        extraQuery: draft.extraQuery.trim(),
+        thinkingStyle: draft.thinkingStyle.trim(),
+      });
+      applyPayload(payload);
+      setExpandedProvider(null);
+      setError(null);
+      return true;
+    } catch (err) {
+      setError((err as Error).message);
+      return false;
+    } finally {
+      setProviderSaving(null);
+    }
+  };
+
   const runProviderOAuth = async (providerName: string, action: "login" | "logout") => {
     if (providerSaving) return;
+    let popup: Window | null = null;
+    if (action === "login" && providerName === "xai_grok" && !remoteBrowserAccess) {
+      try {
+        popup = window.open("about:blank", "_blank");
+        if (popup) popup.opener = null;
+      } catch {
+        popup = null;
+      }
+    }
     setProviderSaving(providerName);
     try {
       const payload =
         action === "login"
           ? await loginProviderOAuth(token, providerName)
           : await logoutProviderOAuth(token, providerName);
+      if (isProviderOAuthAuthorizationRequired(payload)) {
+        try {
+          if (popup && !popup.closed) popup.location.href = payload.authorization_url;
+        } catch {
+          // The dialog keeps the authorization link available when the popup was closed.
+        }
+        xaiOAuthFlowRef.current = payload;
+        setXaiOAuthFlow(payload);
+        setXaiOAuthCode("");
+        setExpandedProvider(providerName);
+        setError(null);
+        return;
+      }
+      popup?.close();
+      closeXaiOAuthFlow();
       applyPayload(payload);
       setExpandedProvider(providerName);
       setError(null);
     } catch (err) {
+      popup?.close();
       setError((err as Error).message);
     } finally {
       setProviderSaving(null);
+    }
+  };
+
+  const completeXaiOAuth = async () => {
+    const flow = xaiOAuthFlowRef.current;
+    const authorizationCode = xaiOAuthCode.trim();
+    if (!flow || !authorizationCode || xaiOAuthCompleting) return;
+    setXaiOAuthCompleting(true);
+    try {
+      const payload = await completeProviderOAuth(
+        token,
+        flow.provider,
+        flow.flow_id,
+        authorizationCode,
+      );
+      if (xaiOAuthFlowRef.current?.flow_id !== flow.flow_id) return;
+      if (isProviderOAuthPending(payload)) return;
+      applyPayload(payload);
+      setExpandedProvider(flow.provider);
+      setError(null);
+      closeXaiOAuthFlow();
+    } catch (err) {
+      if (xaiOAuthFlowRef.current?.flow_id === flow.flow_id) {
+        setError((err as Error).message);
+        closeXaiOAuthFlow();
+      }
+    } finally {
+      setXaiOAuthCompleting(false);
     }
   };
 
@@ -1081,11 +1668,11 @@ export function SettingsView({
     const apiKey = webSearchForm.apiKey?.trim() ?? "";
     const baseUrl = webSearchForm.baseUrl?.trim() ?? "";
     const hasExistingSecret =
-      provider.credential === "api_key" &&
+      webSearchProviderAcceptsApiKey(provider) &&
       webSearchForm.provider === settings.web_search.provider &&
       !!settings.web_search.api_key_hint;
 
-    if (provider.credential === "api_key" && !apiKey && !hasExistingSecret) {
+    if (webSearchProviderRequiresApiKey(provider) && !apiKey && !hasExistingSecret) {
       setError(t("settings.byok.webSearch.apiKeyRequired"));
       return;
     }
@@ -1096,6 +1683,7 @@ export function SettingsView({
 
     setWebSearchSaving(true);
     try {
+      if (provider.name === "olostep" && !(await installCapabilities(["olostep"]))) return;
       const webFetchRestartRequired =
         (webSearchForm.useJinaReader ?? settings.web.fetch.use_jina_reader) !==
         settings.web.fetch.use_jina_reader;
@@ -1105,7 +1693,12 @@ export function SettingsView({
         timeout: webSearchForm.timeout,
         useJinaReader: webSearchForm.useJinaReader,
       };
-      if (provider.credential === "api_key" && apiKey) update.apiKey = apiKey;
+      if (
+        webSearchProviderAcceptsApiKey(provider) &&
+        (apiKey || (provider.credential === "optional_api_key" && webSearchKeyEditing))
+      ) {
+        update.apiKey = apiKey;
+      }
       if (provider.credential === "base_url") update.baseUrl = baseUrl;
       const payload = await updateWebSearchSettings(token, update);
       applyPayload(payload);
@@ -1136,11 +1729,7 @@ export function SettingsView({
     if (!provider) return;
     setProviderForms((prev) => ({
       ...prev,
-      [providerName]: {
-        apiKey: "",
-        apiBase: provider.api_base ?? provider.default_api_base ?? "",
-        apiType: provider.api_type ?? "auto",
-      },
+      [providerName]: providerFormFromRow(provider),
     }));
     setVisibleProviderKeys((prev) => ({ ...prev, [providerName]: false }));
     setEditingProviderKeys((prev) => ({ ...prev, [providerName]: false }));
@@ -1191,9 +1780,14 @@ export function SettingsView({
         setProviderForms((forms) => ({
           ...forms,
           [providerName]: {
+            ...(forms[providerName] ?? providerFormFromRow(
+              settings?.providers.find((provider) => provider.name === providerName) ?? {
+                name: providerName,
+                label: providerName,
+                configured: false,
+              },
+            )),
             apiKey: "",
-            apiBase: forms[providerName]?.apiBase ?? "",
-            apiType: forms[providerName]?.apiType ?? "auto",
           },
         }));
         setVisibleProviderKeys((visible) => ({ ...visible, [providerName]: false }));
@@ -1222,6 +1816,76 @@ export function SettingsView({
       setCliAppsError((err as Error).message);
     } finally {
       setCliAppsAction(null);
+    }
+  };
+
+  const handleNanobotFeatureAction = async (
+    action: "enable" | "disable",
+    name: string,
+    confirmed = false,
+  ) => {
+    const feature = featureCatalog.find((item) => item.name === name);
+    if (action === "enable" && !confirmed && feature && !feature.installed && feature.install_supported) {
+      setNanobotFeaturesError(null);
+      setNanobotFeatureConfirm(feature);
+      return;
+    }
+    const key = `${action}:${name}`;
+    setNanobotFeatureAction(key);
+    setNanobotFeatureConfirm(null);
+    setNanobotFeaturesError(null);
+    try {
+      const payload = action === "enable"
+        ? await enableNanobotFeature(token, name)
+        : await disableNanobotFeature(token, name);
+      setNanobotFeatures(payload);
+      if (payload.requires_restart) {
+        setPendingRestartSections((prev) => ({ ...prev, runtime: true }));
+      }
+    } catch (err) {
+      setNanobotFeaturesError((err as Error).message);
+    } finally {
+      setNanobotFeatureAction(null);
+    }
+  };
+
+  const handleAutomationAction = async (
+    action: AutomationAction,
+    job: SessionAutomationJob,
+  ) => {
+    const key = `${action}:${job.id}`;
+    setAutomationAction(key);
+    setAutomationsError(null);
+    try {
+      const payload = await runAutomationAction(token, action, job.id);
+      setAutomations(payload);
+      if (action === "delete") setAutomationPendingDelete(null);
+      if (action === "run") {
+        window.setTimeout(() => void refreshAutomations(false), 1200);
+        window.setTimeout(() => void refreshAutomations(false), 4000);
+      }
+    } catch (err) {
+      setAutomationsError((err as Error).message);
+    } finally {
+      setAutomationAction(null);
+    }
+  };
+
+  const handleAutomationEdit = async (
+    job: SessionAutomationJob,
+    values: AutomationUpdatePayload,
+  ) => {
+    const key = `update:${job.id}`;
+    setAutomationAction(key);
+    setAutomationsError(null);
+    try {
+      const payload = await updateAutomation(token, job.id, values);
+      setAutomations(payload);
+      setAutomationPendingEdit(null);
+    } catch (err) {
+      setAutomationsError((err as Error).message);
+    } finally {
+      setAutomationAction(null);
     }
   };
 
@@ -1358,23 +2022,38 @@ export function SettingsView({
               setForm={setForm}
               settings={settings}
               dirty={modelDirty}
+              creating={modelPresetCreating}
+              creatingSaving={modelConfigurationSaving}
+              callOrder={modelCallOrder}
               saving={saving}
+              orderSaving={modelCallOrderSaving || modelConfigurationSaving}
+              migrationSaving={modelMigrationSaving}
               showBrandLogos={localPrefs.brandLogos}
               providerSaving={providerSaving}
+              onChangeCallOrder={changeModelCallOrder}
               onProviderOAuthLogin={(provider) => runProviderOAuth(provider, "login")}
               onSave={saveModelSettings}
-              onCreateConfiguration={openModelConfigurationDialog}
+              onMigrate={handleMigrateModelConfigurations}
+              onBeginCreate={beginModelPresetCreation}
+              onCancelCreate={cancelModelPresetCreation}
+              onSelectConfiguration={() => {
+                setModelPresetCreating(false);
+                modelPresetBeforeCreateRef.current = null;
+              }}
+              onDeleteConfiguration={setModelPresetPendingDelete}
             />
             <ProvidersSettings
               settings={settings}
+              nanobotFeatures={nanobotFeatures}
+              featureAction={nanobotFeatureAction}
+              capabilityError={nanobotFeaturesError}
               expandedProvider={expandedProvider}
               providerForms={providerForms}
               visibleProviderKeys={visibleProviderKeys}
               editingProviderKeys={editingProviderKeys}
               providerSaving={providerSaving}
-              query={providerQuery}
               showBrandLogos={localPrefs.brandLogos}
-              onQueryChange={setProviderQuery}
+              remoteBrowserAccess={remoteBrowserAccess}
               onToggleProvider={handleToggleProvider}
               onToggleProviderKey={toggleProviderKeyVisibility}
               onToggleProviderKeyEditing={toggleProviderKeyEditing}
@@ -1382,18 +2061,22 @@ export function SettingsView({
                 setProviderForms((prev) => ({
                   ...prev,
                   [provider]: {
-                    apiKey: prev[provider]?.apiKey ?? "",
-                    apiBase: prev[provider]?.apiBase ?? "",
-                    apiType: prev[provider]?.apiType ?? "auto",
+                    ...(prev[provider] ?? providerFormFromRow(
+                      settings.providers.find((row) => row.name === provider) ?? {
+                        name: provider,
+                        label: provider,
+                        configured: false,
+                      },
+                    )),
                     ...value,
                   },
                 }))
               }
               onSaveProvider={saveProvider}
+              onCreateCustomProvider={createCustomProvider}
               onProviderOAuthLogin={(provider) => runProviderOAuth(provider, "login")}
               onProviderOAuthLogout={(provider) => runProviderOAuth(provider, "logout")}
-              onResetProviderDraft={resetProviderDraft}
-              imageProviderRestartPending={pendingRestartSections.image}
+              imageProviderRestartPending={pendingRestartSections.image || pendingRestartSections.runtime}
               onRestart={restartViaSettingsSurface}
               isRestarting={isRestarting || hostEngineApplying}
             />
@@ -1402,6 +2085,7 @@ export function SettingsView({
       case "image":
         return (
           <ImageGenerationSettings
+            token={token}
             settings={settings}
             form={imageGenerationForm}
             dirty={imageGenerationDirty}
@@ -1453,6 +2137,31 @@ export function SettingsView({
             onRestart={restartViaSettingsSurface}
             isRestarting={isRestarting || hostEngineApplying}
             requiresRestartPending={pendingRestartSections.browser}
+            olostepFeature={featureCatalog.find((feature) => feature.name === "olostep")}
+            olostepInstalling={nanobotFeatureAction === "enable:olostep"}
+            capabilityError={nanobotFeaturesError}
+          />
+        );
+      case "channels":
+        return (
+          <ChannelsSettings
+            token={token}
+            nanobotFeatures={nanobotFeatures}
+            loading={nanobotFeaturesLoading}
+            query={channelsQuery}
+            actionKey={nanobotFeatureAction}
+            chatAppsDocsUrl={settings.docs?.chat_apps_url}
+            showBrandLogos={localPrefs.brandLogos}
+            error={nanobotFeaturesError}
+            requiresRestartPending={pendingRestartSections.runtime}
+            onQueryChange={setChannelsQuery}
+            onAction={handleNanobotFeatureAction}
+            onFeaturesUpdate={setNanobotFeatures}
+            onDismissStatus={() => {
+              setNanobotFeaturesError(null);
+            }}
+            onRestart={restartViaSettingsSurface}
+            isRestarting={isRestarting || hostEngineApplying}
           />
         );
       case "apps":
@@ -1505,6 +2214,24 @@ export function SettingsView({
             isRestarting={isRestarting || hostEngineApplying}
           />
         );
+      case "automations":
+        return (
+          <AutomationsSettings
+            payload={automations}
+            loading={automationsLoading}
+            query={automationsQuery}
+            filter={automationsFilter}
+            sort={automationsSort}
+            actionKey={automationAction}
+            error={automationsError}
+            onQueryChange={setAutomationsQuery}
+            onFilterChange={setAutomationsFilter}
+            onSortChange={setAutomationsSort}
+            onAction={handleAutomationAction}
+            onRequestEdit={setAutomationPendingEdit}
+            onRequestDelete={setAutomationPendingDelete}
+          />
+        );
       case "skills":
         return <SkillsCatalogSettings skills={skills} />;
       case "runtime":
@@ -1519,6 +2246,16 @@ export function SettingsView({
             onRestart={restartViaSettingsSurface}
             isRestarting={isRestarting || hostEngineApplying}
             requiresRestartPending={pendingRestartSections.runtime}
+            apiService={apiService}
+            apiServiceLoading={apiServiceLoading}
+            apiServiceAction={apiServiceAction}
+            apiServiceError={apiServiceError}
+            langfuseFeature={featureCatalog.find((feature) => feature.name === "langfuse")}
+            capabilitiesLoading={nanobotFeaturesLoading}
+            capabilityAction={nanobotFeatureAction}
+            capabilityError={nanobotFeaturesError}
+            onApiServiceAction={handleApiServiceAction}
+            onInstallCapability={(name) => void installCapabilities([name])}
           />
         );
       case "advanced":
@@ -1541,7 +2278,7 @@ export function SettingsView({
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-[radial-gradient(circle_at_50%_0%,hsl(var(--muted))_0%,hsl(var(--background))_42%)] md:flex-row">
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-settings-canvas lg:flex-row">
       {showSidebar ? (
         <SettingsSidebar
           activeSection={activeSection}
@@ -1552,45 +2289,91 @@ export function SettingsView({
         />
       ) : null}
 
-      <NewModelConfigurationDialog
-        open={modelConfigurationOpen}
-        draft={modelConfigurationForm}
-        providers={configuredModelProviderOptions}
-        saving={modelConfigurationSaving}
-        showProviderLogos={localPrefs.brandLogos}
-        onOpenChange={setModelConfigurationOpen}
-        onChangeDraft={setModelConfigurationForm}
-        onSave={handleCreateModelConfiguration}
+      <ModelPresetDeleteDialog
+        preset={modelPresetPendingDelete}
+        deleting={saving}
+        onOpenChange={(open) => {
+          if (!open) setModelPresetPendingDelete(null);
+        }}
+        onConfirm={handleDeleteModelConfiguration}
       />
 
-      <main className="min-w-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
+      <XaiOAuthLoginDialog
+        flow={xaiOAuthFlow}
+        authorizationCode={xaiOAuthCode}
+        completing={xaiOAuthCompleting}
+        remoteBrowserAccess={remoteBrowserAccess}
+        onAuthorizationCodeChange={setXaiOAuthCode}
+        onOpenAuthorization={() => {
+          if (!xaiOAuthFlow) return;
+          const opened = window.open(xaiOAuthFlow.authorization_url, "_blank", "noopener,noreferrer");
+          if (opened) opened.opener = null;
+        }}
+        onComplete={() => void completeXaiOAuth()}
+        onClose={closeXaiOAuthFlow}
+      />
+
+      <NanobotFeatureInstallDialog
+        feature={nanobotFeatureConfirm}
+        installing={nanobotFeatureAction === `enable:${nanobotFeatureConfirm?.name ?? ""}`}
+        onOpenChange={(open) => {
+          if (!open) setNanobotFeatureConfirm(null);
+        }}
+        onConfirm={(feature) => handleNanobotFeatureAction("enable", feature.name, true)}
+      />
+
+      <AutomationDeleteDialog
+        job={automationPendingDelete}
+        deleting={automationAction === `delete:${automationPendingDelete?.id ?? ""}`}
+        onOpenChange={(open) => {
+          if (!open) setAutomationPendingDelete(null);
+        }}
+        onConfirm={(job) => handleAutomationAction("delete", job)}
+      />
+
+      <AutomationEditDialog
+        job={automationPendingEdit}
+        saving={automationAction === `update:${automationPendingEdit?.id ?? ""}`}
+        onOpenChange={(open) => {
+          if (!open) setAutomationPendingEdit(null);
+        }}
+        onSave={handleAutomationEdit}
+      />
+
+      <main
+        className={cn(
+          "min-w-0 flex-1 bg-settings-canvas [scrollbar-gutter:stable]",
+          activeSection === "channels" ? "overflow-y-auto xl:overflow-hidden" : "overflow-y-auto",
+        )}
+      >
         <div
           className={cn(
-            "mx-auto w-full max-w-[920px] px-5 py-8 sm:px-8 lg:py-12",
+            "mx-auto w-full px-4 py-6 sm:px-8 sm:py-8 lg:py-12",
+            activeSection === "channels" ? "max-w-[1240px] xl:px-10" : "max-w-[920px]",
+            activeSection === "channels" && "flex min-h-full flex-col xl:h-full xl:min-h-0",
             hostChromeInset && "pt-[4.25rem] sm:pt-[4.25rem] lg:pt-[4.75rem]",
           )}
         >
-          <div className="mb-7">
-            {!showSidebar ? (
+          {!showSidebar ? (
+            <div className="mb-7">
               <button
                 type="button"
                 onClick={onBackToChat}
-                className="mb-4 inline-flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground lg:hidden"
+                className="touch-target mb-4 inline-flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground lg:hidden"
               >
                 <ChevronLeft className="h-3.5 w-3.5" aria-hidden />
                 {t("settings.backToChat")}
               </button>
-            ) : null}
-            <p className="mb-2 text-[12px] font-normal text-muted-foreground">
-              {t("settings.sidebar.title")}
-            </p>
-            <h1 className="text-[24px] font-normal leading-tight tracking-normal text-foreground sm:text-[28px]">
-              {text(`settings.nav.${activeSection}`, titleForSection(activeSection))}
-            </h1>
-          </div>
+              <h1 className="text-[24px] font-normal leading-tight tracking-normal text-foreground sm:text-[28px]">
+                {t(`settings.nav.${activeSection}`, {
+                  defaultValue: standaloneSectionTitle(activeSection),
+                })}
+              </h1>
+            </div>
+          ) : null}
 
           {loading ? (
-            <div className="flex h-48 items-center justify-center rounded-[24px] border border-border/50 bg-card/75 text-sm text-muted-foreground shadow-[0_20px_70px_rgba(15,23,42,0.07)]">
+            <div className="flex h-48 items-center justify-center rounded-[22px] bg-settings-surface text-sm text-muted-foreground">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               {t("settings.status.loading")}
             </div>
@@ -1601,7 +2384,13 @@ export function SettingsView({
               </SettingsRow>
             </SettingsGroup>
           ) : settings ? (
-            <div className="space-y-5">
+            <div
+              className={cn(
+                "space-y-5",
+                activeSection === "channels" &&
+                  "flex min-h-0 flex-1 flex-col xl:overflow-hidden",
+              )}
+            >
               {error ? (
                 <div className="rounded-[18px] border border-destructive/20 bg-destructive/5 px-4 py-3 text-[13px] text-destructive">
                   {error}
@@ -1623,6 +2412,7 @@ const SETTINGS_NAV_ITEMS: Array<{ key: SettingsSectionKey; icon: LucideIcon; fal
   { key: "image", icon: ImageIcon, fallback: "Image" },
   { key: "voice", icon: Mic, fallback: "Voice" },
   { key: "browser", icon: Globe2, fallback: "Web" },
+  { key: "channels", icon: MessageCircle, fallback: "Channels" },
   { key: "runtime", icon: Server, fallback: "System" },
   { key: "advanced", icon: ShieldCheck, fallback: "Security" },
 ];
@@ -1631,7 +2421,10 @@ function visibleWebuiDefaultAccessMode(mode: string | null | undefined): WebuiDe
   return mode === "full" ? "full" : "default";
 }
 
-function titleForSection(section: SettingsSectionKey): string {
+function standaloneSectionTitle(section: SettingsSectionKey): string {
+  if (section === "apps") return "Apps";
+  if (section === "automations") return "Automations";
+  if (section === "skills") return "Skills";
   return SETTINGS_NAV_ITEMS.find((item) => item.key === section)?.fallback ?? "Settings";
 }
 
@@ -1649,22 +2442,29 @@ function SettingsSidebar({
   hostChromeInset?: boolean;
 }) {
   const { t } = useTranslation();
+  const activeItem = SETTINGS_NAV_ITEMS.find((item) => item.key === activeSection)
+    ?? SETTINGS_NAV_ITEMS[0];
+  const ActiveIcon = activeItem.icon;
+  const activeLabel = t(`settings.nav.${activeItem.key}`, {
+    defaultValue: activeItem.fallback,
+  });
+
   return (
     <aside
       className={cn(
-        "flex w-full shrink-0 flex-col border-b border-border/55 bg-card/62 px-4 pb-3 shadow-[inset_0_-1px_0_rgba(255,255,255,0.55)] backdrop-blur-xl dark:bg-card/45 dark:shadow-none md:w-[17rem] md:border-b-0 md:border-r md:px-3 md:pb-4 md:shadow-[inset_-1px_0_0_rgba(255,255,255,0.55)]",
-        hostChromeInset ? "pt-[4.25rem] md:pt-[4.25rem]" : "pt-4 md:pt-4",
+        "flex w-full shrink-0 flex-col bg-settings-surface px-3 pb-2 lg:w-[17rem] lg:px-3 lg:pb-4",
+        hostChromeInset ? "pt-[4.25rem] lg:pt-[4.25rem]" : "pt-4 lg:pt-4",
       )}
     >
       <button
         type="button"
         onClick={onBackToChat}
-        className="mb-2 inline-flex w-fit items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground md:mb-3"
+        className="touch-target mb-2 inline-flex w-fit items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground lg:mb-3"
       >
         <ChevronLeft className="h-3.5 w-3.5" aria-hidden />
         {t("settings.backToChat")}
       </button>
-      <div className="mb-3 px-1 md:mb-4 md:px-2">
+      <div className="mb-3 px-1 lg:mb-4 lg:px-2">
         <h2 className="text-[18px] font-normal tracking-normal text-foreground">
           {t("settings.sidebar.title")}
         </h2>
@@ -1672,31 +2472,75 @@ function SettingsSidebar({
 
       <nav
         aria-label={t("settings.sidebar.ariaLabel")}
-        className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden md:mx-0 md:block md:space-y-1 md:overflow-visible md:px-0 md:pb-0"
+        className="w-full"
       >
-        {SETTINGS_NAV_ITEMS.map(({ key, icon: Icon, fallback }) => {
-          const active = key === activeSection;
-          return (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
             <button
-              key={key}
               type="button"
-              aria-current={active ? "page" : undefined}
-              onClick={() => onSelectSection(key)}
-              className={cn(
-                "flex h-9 w-auto shrink-0 items-center gap-2 rounded-full px-3 text-left text-[13px] font-medium transition-colors md:w-full md:rounded-[10px] md:px-2.5",
-                active
-                  ? "bg-muted/90 text-foreground shadow-[inset_0_0_0_1px_rgba(0,0,0,0.025)]"
-                  : "text-muted-foreground/78 hover:bg-muted/45 hover:text-foreground",
-              )}
+              aria-label={`${t("settings.sidebar.title")}: ${activeLabel}`}
+              className="touch-target flex h-11 w-full items-center gap-2.5 rounded-[14px] bg-sidebar-accent px-3 text-left text-[13px] font-medium text-foreground transition-colors hover:bg-sidebar-accent/80 lg:hidden"
             >
-              <Icon className="h-4 w-4 shrink-0" strokeWidth={2} aria-hidden />
-              <span className="truncate">{t(`settings.nav.${key}`, { defaultValue: fallback })}</span>
+              <ActiveIcon className="h-4 w-4 shrink-0" strokeWidth={2} aria-hidden />
+              <span className="min-w-0 flex-1 truncate">{activeLabel}</span>
+              <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
             </button>
-          );
-        })}
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="start"
+            sideOffset={6}
+            className="w-[var(--radix-dropdown-menu-trigger-width)] max-w-[calc(100vw-1.5rem)] rounded-[16px] p-1.5"
+          >
+            {SETTINGS_NAV_ITEMS.map(({ key, icon: Icon, fallback }) => {
+              const active = key === activeSection;
+              return (
+                <DropdownMenuItem
+                  key={key}
+                  aria-current={active ? "page" : undefined}
+                  onSelect={() => onSelectSection(key)}
+                  className={cn(
+                    "flex h-10 cursor-default items-center gap-2.5 rounded-[11px] px-2.5 text-[13px] font-medium",
+                    active && "bg-sidebar-accent text-foreground focus:bg-sidebar-accent",
+                  )}
+                >
+                  <Icon className="h-4 w-4 shrink-0" strokeWidth={2} aria-hidden />
+                  <span className="min-w-0 flex-1 truncate">
+                    {t(`settings.nav.${key}`, { defaultValue: fallback })}
+                  </span>
+                  {active ? <Check className="h-4 w-4 shrink-0" aria-hidden /> : null}
+                </DropdownMenuItem>
+              );
+            })}
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <div className="hidden space-y-1 lg:block">
+          {SETTINGS_NAV_ITEMS.map(({ key, icon: Icon, fallback }) => {
+            const active = key === activeSection;
+            return (
+              <button
+                key={key}
+                type="button"
+                aria-current={active ? "page" : undefined}
+                onClick={() => onSelectSection(key)}
+                className={cn(
+                  "touch-target flex h-9 w-full items-center gap-2 rounded-[10px] px-2.5 text-left text-[13px] font-medium transition-colors",
+                  active
+                    ? "bg-sidebar-accent text-foreground"
+                    : "text-muted-foreground/78 hover:bg-muted/45 hover:text-foreground",
+                )}
+              >
+                <Icon className="h-4 w-4 shrink-0" strokeWidth={2} aria-hidden />
+                <span className="truncate">
+                  {t(`settings.nav.${key}`, { defaultValue: fallback })}
+                </span>
+              </button>
+            );
+          })}
+        </div>
       </nav>
 
-      <div className="hidden md:mt-auto md:block md:pt-4">
+      <div className="hidden lg:mt-auto lg:block lg:pt-4">
         {onLogout && !hostChromeInset ? (
           <Button
             type="button"
@@ -1726,7 +2570,12 @@ function OverviewSettings({
 }) {
   const { t } = useTranslation();
   const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
-  const activePreset = settings.agent.model_preset || "default";
+  const activePresetName = settings.agent.model_preset;
+  const activePreset =
+    activePresetName && activePresetName !== "default"
+      ? settings.model_presets.find((preset) => preset.name === activePresetName)?.label ??
+        activePresetName
+      : null;
   const activeProvider = settings.agent.resolved_provider ?? settings.agent.provider;
   const activeProviderConfigured = settingsProviderConfigured(settings, activeProvider);
   const activeProviderLabel = providerDisplayLabel(settings.providers, activeProvider);
@@ -1734,7 +2583,7 @@ function OverviewSettings({
     ? settings.agent.model
     : tx("settings.values.notConfigured", "Not configured");
   const activeModelCaption = activeProviderConfigured
-    ? `${activeProvider} · ${activePreset}`
+    ? [activeProvider, activePreset].filter(Boolean).join(" · ")
     : activeProviderLabel || settings.agent.model
       ? [activeProviderLabel, settings.agent.model].filter(Boolean).join(" · ")
       : tx("settings.byok.noConfiguredProviders", "No configured providers");
@@ -1751,6 +2600,10 @@ function OverviewSettings({
   const webSearchCredentialStatus =
     webSearchProvider?.credential === "none"
       ? tx("settings.byok.webSearch.noCredentialRequired", "No key required")
+      : webSearchProvider?.credential === "optional_api_key"
+        ? settings.web_search.api_key_hint
+          ? tx("settings.values.configured", "Configured")
+          : tx("settings.byok.webSearch.noCredentialRequired", "No key required")
       : webSearchProvider?.credential === "base_url"
         ? settings.web_search.base_url
           ? tx("settings.values.configured", "Configured")
@@ -1791,7 +2644,7 @@ function OverviewSettings({
       : tx("settings.values.ready", "Ready");
   return (
     <div className="space-y-7">
-      <section>
+      <section className="rounded-[22px] bg-settings-surface px-4 py-4 sm:px-5">
         <TokenUsageHeatmap usage={settings.usage} timeZone={settings.agent.timezone} />
       </section>
 
@@ -1942,7 +2795,10 @@ function VersionCheckRow({ currentVersion }: { currentVersion?: string }) {
         {result?.type === "update" ? (
           <span className="inline-flex items-center gap-1.5 text-[12px] text-blue-600 dark:text-blue-300">
             <ArrowUpCircle className="h-3 w-3" aria-hidden />
-            {tx("settings.about.updateAvailable", "Update available")}{result.latestVersion && ` v${result.latestVersion}`}
+            {t("settings.about.updateAvailable", {
+              defaultValue: "Update available v{{version}}",
+              version: result.latestVersion,
+            })}
             {result.pypiUrl ? (
               <a
                 href={result.pypiUrl}
@@ -1994,7 +2850,8 @@ function AppearanceSettings({
               <span
                 className={cn(
                   "rounded-full px-3 py-1 transition-colors",
-                  theme === "light" && "bg-background text-foreground shadow-sm",
+                  theme === "light" &&
+                    "bg-background text-foreground ring-1 ring-inset ring-border/45",
                 )}
               >
                 {t("settings.values.light")}
@@ -2002,7 +2859,8 @@ function AppearanceSettings({
               <span
                 className={cn(
                   "rounded-full px-3 py-1 transition-colors",
-                  theme === "dark" && "bg-background text-foreground shadow-sm",
+                  theme === "dark" &&
+                    "bg-background text-foreground ring-1 ring-inset ring-border/45",
                 )}
               >
                 {t("settings.values.dark")}
@@ -2053,6 +2911,25 @@ function AppearanceSettings({
             />
           </SettingsRow>
           <SettingsRow
+            title={tx("settings.rows.fileEditDisplay", "File edit display")}
+            description={tx("settings.help.fileEditDisplay", "Choose whether file edit activity opens as line counts or a diff.")}
+          >
+            <SegmentedControl
+              value={localPrefs.fileEditDisplayMode}
+              options={[
+                { value: "summary", label: tx("settings.values.summary", "Summary") },
+                { value: "diff", label: tx("settings.values.diff", "Diff") },
+                { value: "collapsed_diff", label: tx("settings.values.collapsedDiff", "Collapsed diff") },
+              ]}
+              onChange={(fileEditDisplayMode) =>
+                onChangeLocalPrefs((prev) => ({
+                  ...prev,
+                  fileEditDisplayMode: fileEditDisplayMode as FileEditDisplayMode,
+                }))
+              }
+            />
+          </SettingsRow>
+          <SettingsRow
             title={tx("settings.rows.codeWrap", "Code wrapping")}
             description={tx("settings.help.codeWrap", "Keep long code lines readable on smaller screens.")}
           >
@@ -2080,119 +2957,162 @@ function AppearanceSettings({
   );
 }
 
-function NewModelConfigurationDialog({
-  open,
-  draft,
-  providers,
-  saving,
-  showProviderLogos,
-  onOpenChange,
-  onChangeDraft,
-  onSave,
+function XaiOAuthLoginDialog({
+  flow,
+  authorizationCode,
+  completing,
+  remoteBrowserAccess,
+  onAuthorizationCodeChange,
+  onOpenAuthorization,
+  onComplete,
+  onClose,
 }: {
-  open: boolean;
-  draft: ModelConfigurationDraft;
-  providers: Array<{ name: string; label: string }>;
-  saving: boolean;
-  showProviderLogos: boolean;
-  onOpenChange: (open: boolean) => void;
-  onChangeDraft: Dispatch<SetStateAction<ModelConfigurationDraft>>;
-  onSave: () => void;
+  flow: ProviderOAuthAuthorizationRequired | null;
+  authorizationCode: string;
+  completing: boolean;
+  remoteBrowserAccess: boolean;
+  onAuthorizationCodeChange: (value: string) => void;
+  onOpenAuthorization: () => void;
+  onComplete: () => void;
+  onClose: () => void;
 }) {
   const { t } = useTranslation();
-  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
-  const canSave = Boolean(draft.label.trim() && draft.provider.trim() && draft.model.trim());
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[520px] rounded-[28px] border-border/55 bg-card/95 p-0 shadow-[0_28px_90px_rgba(15,23,42,0.20)] backdrop-blur-xl dark:border-white/10">
+    <Dialog
+      open={Boolean(flow)}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DialogContent className="w-[min(calc(100vw-2rem),28rem)] rounded-[24px]">
         <form
+          className="space-y-4"
           onSubmit={(event) => {
             event.preventDefault();
-            onSave();
+            onComplete();
           }}
         >
-          <DialogHeader className="border-b border-border/45 px-5 py-4 text-left">
-            <DialogTitle className="text-[18px] font-semibold tracking-[-0.01em]">
-              {tx("settings.models.newConfiguration", "New model configuration")}
-            </DialogTitle>
-            <DialogDescription className="text-[12.5px] leading-5">
-              {tx("settings.models.newConfigurationHelp", "Save a provider and model as a one-click option.")}
+          <DialogHeader>
+            <DialogTitle>xAI Grok</DialogTitle>
+            <DialogDescription>
+              {remoteBrowserAccess
+                ? t("settings.oauth.remoteCodeHelp")
+                : t("settings.oauth.localCodeHelp")}
             </DialogDescription>
           </DialogHeader>
-
-          <div className="space-y-4 px-5 py-5">
-            <label className="block">
-              <span className="mb-1.5 block text-[12px] font-medium text-muted-foreground">
-                {tx("settings.models.configurationName", "Configuration name")}
-              </span>
-              <Input
-                autoFocus
-                value={draft.label}
-                placeholder={tx("settings.models.configurationNamePlaceholder", "Fast writing")}
-                onChange={(event) =>
-                  onChangeDraft((prev) => ({ ...prev, label: event.target.value }))
-                }
-                className="h-10 rounded-full px-4 text-[14px]"
-              />
+          <div className="space-y-2">
+            <label
+              htmlFor="xai-oauth-code"
+              className="block text-xs font-medium text-foreground"
+            >
+              {t("settings.oauth.authorizationCode")}
             </label>
-
-            <div className="grid gap-4 sm:grid-cols-[1fr_auto] sm:items-end">
-              <label className="block">
-                <span className="mb-1.5 block text-[12px] font-medium text-muted-foreground">
-                  {tx("settings.rows.model", "Model")}
-                </span>
-                <Input
-                  value={draft.model}
-                  placeholder="openai/gpt-4.1"
-                  onChange={(event) =>
-                    onChangeDraft((prev) => ({ ...prev, model: event.target.value }))
-                  }
-                  className="h-10 rounded-full px-4 text-[14px]"
-                />
-              </label>
-              <div className="block">
-                <span className="mb-1.5 block text-[12px] font-medium text-muted-foreground">
-                  {tx("settings.rows.provider", "Provider")}
-                </span>
-                <ProviderPicker
-                  providers={providers}
-                  value={draft.provider}
-                  emptyLabel={tx("settings.byok.noConfiguredProviders", "No configured providers")}
-                  showProviderLogos={showProviderLogos}
-                  onChange={(provider) =>
-                    onChangeDraft((prev) => ({ ...prev, provider }))
-                  }
-                />
-              </div>
-            </div>
+            <Input
+              id="xai-oauth-code"
+              value={authorizationCode}
+              onChange={(event) => onAuthorizationCodeChange(event.target.value)}
+              placeholder={t("settings.oauth.authorizationCode")}
+              aria-label={t("settings.oauth.authorizationCode")}
+              autoComplete="off"
+              spellCheck={false}
+            />
           </div>
-
-          <DialogFooter className="border-t border-border/45 px-5 py-4 sm:space-x-2">
-            <Button
-              type="button"
-              variant="ghost"
-              className="rounded-full"
-              disabled={saving}
-              onClick={() => onOpenChange(false)}
-            >
-              {tx("settings.actions.cancel", "Cancel")}
+          <DialogFooter className="gap-2 sm:space-x-0">
+            <Button type="button" variant="outline" onClick={onOpenAuthorization}>
+              <ExternalLink className="mr-2 h-4 w-4" aria-hidden />
+              {t("settings.oauth.signIn")}
             </Button>
-            <Button
-              type="submit"
-              variant="outline"
-              className="rounded-full"
-              disabled={!canSave || saving || providers.length === 0}
-            >
-              {saving ? (
-                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
-              ) : null}
-              {saving ? tx("settings.actions.saving", "Saving...") : tx("settings.actions.save", "Save")}
+            <Button type="submit" disabled={!authorizationCode.trim() || completing}>
+              {completing ? t("settings.oauth.signingIn") : t("settings.oauth.finishSignIn")}
             </Button>
           </DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function ModelPresetDeleteDialog({
+  preset,
+  deleting,
+  onOpenChange,
+  onConfirm,
+}: {
+  preset: SettingsPayload["model_presets"][number] | null;
+  deleting: boolean;
+  onOpenChange: (open: boolean) => void;
+  onConfirm: () => void;
+}) {
+  const { t } = useTranslation();
+  const tx = (key: string, fallback: string, values?: Record<string, unknown>) =>
+    t(key, { defaultValue: fallback, ...(values ?? {}) });
+  return (
+    <Dialog open={preset !== null} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-[440px] rounded-[24px]">
+        <DialogHeader className="text-left">
+          <DialogTitle>
+            {tx("settings.models.deletePresetTitle", "Delete model preset?")}
+          </DialogTitle>
+          <DialogDescription className="leading-5">
+            {tx(
+              "settings.models.deletePresetHelp",
+              "This removes the preset “{{name}}”. Provider credentials are not affected.",
+              { name: preset?.label ?? "" },
+            )}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter className="gap-2 sm:space-x-0">
+          <Button
+            type="button"
+            variant="ghost"
+            className="rounded-full"
+            disabled={deleting}
+            onClick={() => onOpenChange(false)}
+          >
+            {tx("settings.actions.cancel", "Cancel")}
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            className="rounded-full"
+            disabled={deleting}
+            onClick={onConfirm}
+          >
+            {deleting ? (
+              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+            ) : null}
+            {deleting
+              ? tx("settings.actions.deleting", "Deleting...")
+              : tx("settings.actions.delete", "Delete")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function CapabilityInstallNotice({
+  title,
+  description,
+  installing = false,
+}: {
+  title: string;
+  description: string;
+  installing?: boolean;
+}) {
+  return (
+    <div className="flex items-start gap-3 rounded-[14px] border border-border/55 bg-muted/22 px-3.5 py-3">
+      {installing ? (
+        <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-muted-foreground" aria-hidden />
+      ) : (
+        <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+      )}
+      <div className="min-w-0">
+        <p className="text-[12.5px] font-medium text-foreground">{title}</p>
+        <p className="mt-0.5 text-[12px] leading-5 text-muted-foreground">{description}</p>
+      </div>
+    </div>
   );
 }
 
@@ -2202,263 +3122,1061 @@ function ModelsSettings({
   setForm,
   settings,
   dirty,
+  creating,
+  creatingSaving,
+  callOrder,
   saving,
+  orderSaving,
+  migrationSaving,
   showBrandLogos,
   providerSaving,
+  onChangeCallOrder,
   onProviderOAuthLogin,
   onSave,
-  onCreateConfiguration,
+  onMigrate,
+  onBeginCreate,
+  onCancelCreate,
+  onSelectConfiguration,
+  onDeleteConfiguration,
 }: {
   token: string;
   form: AgentSettingsDraft;
   setForm: Dispatch<SetStateAction<AgentSettingsDraft>>;
   settings: SettingsPayload;
   dirty: boolean;
+  creating: boolean;
+  creatingSaving: boolean;
+  callOrder: string[];
   saving: boolean;
+  orderSaving: boolean;
+  migrationSaving: boolean;
   showBrandLogos: boolean;
   providerSaving: string | null;
+  onChangeCallOrder: (order: string[]) => void;
   onProviderOAuthLogin: (provider: string) => void;
   onSave: () => void;
-  onCreateConfiguration: () => void;
+  onMigrate: () => void;
+  onBeginCreate: () => void;
+  onCancelCreate: () => void;
+  onSelectConfiguration: () => void;
+  onDeleteConfiguration: (preset: SettingsPayload["model_presets"][number]) => void;
 }) {
   const { t } = useTranslation();
-  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
+  const tx = (key: string, fallback: string, values?: Record<string, unknown>) =>
+    t(key, { defaultValue: fallback, ...(values ?? {}) });
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [draggedCallOrderIndex, setDraggedCallOrderIndex] = useState<number | null>(null);
+  const [dragOverCallOrderIndex, setDragOverCallOrderIndex] = useState<number | null>(null);
+  const namedPresets = settings.model_presets.filter((preset) => !preset.is_default);
+  const namedPresetsByName = new Map(namedPresets.map((preset) => [preset.name, preset]));
+  const unorderedPresets = namedPresets.filter((preset) => !callOrder.includes(preset.name));
+  const callOrderOccurrences = new Map<string, number>();
+  const presetRows = [
+    ...callOrder.map((name, orderIndex) => {
+      const occurrence = callOrderOccurrences.get(name) ?? 0;
+      callOrderOccurrences.set(name, occurrence + 1);
+      return {
+        key: `ordered:${name}:${occurrence}`,
+        name,
+        orderIndex,
+        preset: namedPresetsByName.get(name),
+      };
+    }),
+    ...unorderedPresets.map((preset) => ({
+      key: `disabled:${preset.name}`,
+      name: preset.name,
+      orderIndex: -1,
+      preset,
+    })),
+  ];
+  const selectedPreset = namedPresetsByName.get(form.modelPreset) ?? null;
+  useEffect(() => {
+    setAdvancedOpen(false);
+  }, [editorOpen, selectedPreset?.name]);
+
   const configuredProviders = settings.providers.filter((provider) => provider.configured);
-  const showAutoProvider = defaultPreset(settings)?.provider === "auto" || form.provider === "auto";
-  const selectableProviders = uniqueProviders(configuredProviders);
+  const selectedProvider = settings.providers.find((provider) => provider.name === form.provider);
+  const selectableProviders = uniqueProviders([
+    ...configuredProviders,
+    ...(selectedProvider ? [selectedProvider] : []),
+  ]);
+  const showAutoProvider = selectedPreset?.provider === "auto" || form.provider === "auto";
   const providerOptions = showAutoProvider
     ? [{ name: "auto", label: tx("settings.values.auto", "Auto") }, ...selectableProviders]
     : selectableProviders;
   const providerValue = providerOptions.some((provider) => provider.name === form.provider)
     ? form.provider
     : "";
-  const selectedPreset =
-    settings.model_presets.find((preset) => preset.name === form.modelPreset) ?? null;
-  const selectedProvider = settings.providers.find((provider) => provider.name === form.provider);
   const selectedProviderNeedsSignIn =
     selectedProvider?.auth_type === "oauth" && !selectedProvider.configured;
   const selectedProviderSigningIn = providerSaving === selectedProvider?.name;
-  const selectedProviderConfigured = settingsProviderConfigured(settings, form.provider);
+  const selectedProviderConfigured = settingsProviderConfigured(
+    settings,
+    form.provider,
+    selectedPreset?.resolved_provider,
+  );
   const modelFieldsMissing =
     !form.model.trim() ||
     !form.provider.trim() ||
-    Boolean(selectedPreset && !selectedPreset.is_default && !form.presetLabel.trim());
+    !form.presetLabel.trim() ||
+    form.maxTokens <= 0 ||
+    form.temperature < 0 ||
+    form.temperature > 2;
+  const selectedPresetReferenced = Boolean(
+    selectedPreset && (settings.model_call_order ?? []).includes(selectedPreset.name),
+  );
+  const callOrderBusy = orderSaving || saving;
+  const selectPreset = (preset: SettingsPayload["model_presets"][number]) => {
+    const toggleCurrentPreset = !creating && selectedPreset?.name === preset.name;
+    onSelectConfiguration();
+    if (toggleCurrentPreset) {
+      setEditorOpen((open) => !open);
+      return;
+    }
+    setForm((prev) => ({
+      ...prev,
+      modelPreset: preset.name,
+      model: preset.model,
+      provider: preset.provider,
+      presetLabel: preset.label,
+      maxTokens: preset.max_tokens,
+      contextWindowTokens: normalizeContextWindowTokens(preset.context_window_tokens),
+      temperature: preset.temperature,
+      reasoningEffort: preset.reasoning_effort ?? "",
+    }));
+    setEditorOpen(true);
+  };
+
+  const moveCallOrderItem = (index: number, offset: -1 | 1) => {
+    if (callOrderBusy) return;
+    const nextIndex = index + offset;
+    if (nextIndex < 0 || nextIndex >= callOrder.length) return;
+    const next = [...callOrder];
+    [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+    onChangeCallOrder(next);
+  };
+
+  const removeCallOrderItem = (index: number) => {
+    if (callOrderBusy || callOrder.length <= 1) return;
+    onChangeCallOrder(callOrder.filter((_, itemIndex) => itemIndex !== index));
+  };
+
+  const dropCallOrderItem = (targetIndex: number) => {
+    if (
+      callOrderBusy ||
+      draggedCallOrderIndex === null ||
+      draggedCallOrderIndex === targetIndex
+    ) {
+      setDraggedCallOrderIndex(null);
+      setDragOverCallOrderIndex(null);
+      return;
+    }
+    const next = [...callOrder];
+    const moved = next.splice(draggedCallOrderIndex, 1)[0];
+    if (!moved) {
+      setDraggedCallOrderIndex(null);
+      setDragOverCallOrderIndex(null);
+      return;
+    }
+    next.splice(targetIndex, 0, moved);
+    setDraggedCallOrderIndex(null);
+    setDragOverCallOrderIndex(null);
+    onChangeCallOrder(next);
+  };
+
   return (
     <div className="space-y-7">
       <section>
+        <SettingsSectionTitle>
+          {tx("settings.models.presets", "Model presets")}
+        </SettingsSectionTitle>
         <SettingsGroup>
-          <SettingsRow
-            title={tx("settings.rows.currentModel", "Current configuration")}
-            description={tx("settings.help.currentModel", "Used for new replies.")}
-          >
-            <ModelPresetPicker
-              presets={settings.model_presets}
-              value={form.modelPreset}
-              settings={settings}
-              draftModel={form.model}
-              draftProvider={form.provider}
-              providerConfigured={selectedProviderConfigured}
-              showProviderLogos={showBrandLogos}
-              onChange={(modelPreset) => {
-                const nextPreset = settings.model_presets.find((preset) => preset.name === modelPreset);
-                setForm((prev) => ({
-                  ...prev,
-                  modelPreset,
-                  model: nextPreset?.model ?? prev.model,
-                  provider: nextPreset?.is_default
-                    ? editableDefaultProvider(settings)
-                    : nextPreset?.provider ?? prev.provider,
-                  presetLabel: nextPreset?.label ?? modelPreset,
-                  contextWindowTokens: normalizeContextWindowTokens(
-                    nextPreset?.context_window_tokens ?? prev.contextWindowTokens,
-                  ),
-                }));
-              }}
-              onCreateConfiguration={onCreateConfiguration}
-            />
-          </SettingsRow>
-          {selectedPreset && !selectedPreset.is_default ? (
-            <SettingsRow
-              title={tx("settings.models.configurationName", "Configuration name")}
-              description={tx("settings.models.configurationNameHelp", "Rename this saved model configuration.")}
-            >
+          {!settings.model_call_order_editable ? (
+            <div className="flex flex-col gap-4 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+              <div className="flex min-w-0 items-start gap-3">
+                <span className="grid h-9 w-9 shrink-0 place-items-center rounded-[12px] bg-muted text-muted-foreground">
+                  <ListOrdered className="h-4 w-4" aria-hidden />
+                </span>
+                <div className="min-w-0">
+                  <p className="text-[14px] font-medium text-foreground">
+                    {tx("settings.models.convertTitle", "Convert the current model setup")}
+                  </p>
+                  <p className="mt-0.5 max-w-[34rem] text-[12px] leading-5 text-muted-foreground">
+                    {tx(
+                      "settings.models.convertHelp",
+                      "Turn the existing primary and fallback models into presets so their order can be managed here.",
+                    )}
+                  </p>
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="shrink-0 rounded-full"
+                disabled={migrationSaving}
+                onClick={onMigrate}
+              >
+                {migrationSaving ? (
+                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+                ) : null}
+                {migrationSaving
+                  ? tx("settings.models.converting", "Converting...")
+                  : tx("settings.models.convertAction", "Convert to presets")}
+              </Button>
+            </div>
+          ) : (
+            <>
+              <div role="list" className="divide-y divide-border/45">
+                {presetRows.map(({ key, name, orderIndex, preset }) => {
+                  const ordered = orderIndex >= 0;
+                  const provider = preset
+                    ? modelPresetProviderKey(preset, settings)
+                    : settings.agent.resolved_provider ?? settings.agent.provider;
+                  const presetConfigured = preset
+                    ? settingsProviderConfigured(
+                        settings,
+                        preset.provider,
+                        preset.resolved_provider,
+                      )
+                    : true;
+                  const isDropTarget =
+                    ordered &&
+                    dragOverCallOrderIndex === orderIndex &&
+                    draggedCallOrderIndex !== orderIndex;
+                  const dropAfterTarget =
+                    isDropTarget &&
+                    draggedCallOrderIndex !== null &&
+                    draggedCallOrderIndex < orderIndex;
+                  return (
+                    <div
+                      key={key}
+                      role="listitem"
+                      tabIndex={ordered ? 0 : -1}
+                      draggable={ordered && !callOrderBusy}
+                      aria-label={
+                        ordered
+                          ? `${preset?.label ?? name}. ${tx(
+                              "settings.models.dragToReorder",
+                              "Drag to reorder",
+                            )}`
+                          : preset?.label ?? name
+                      }
+                      data-testid={`model-call-order-row-${name}`}
+                      onDragStart={(event) => {
+                        if (!ordered || callOrderBusy) {
+                          event.preventDefault();
+                          return;
+                        }
+                        event.dataTransfer.effectAllowed = "move";
+                        event.dataTransfer.setData("text/plain", name);
+                        setDraggedCallOrderIndex(orderIndex);
+                        setDragOverCallOrderIndex(orderIndex);
+                      }}
+                      onDragEnd={() => {
+                        setDraggedCallOrderIndex(null);
+                        setDragOverCallOrderIndex(null);
+                      }}
+                      onDragEnter={(event) => {
+                        if (ordered && draggedCallOrderIndex !== null) {
+                          event.preventDefault();
+                          setDragOverCallOrderIndex(orderIndex);
+                        }
+                      }}
+                      onDragOver={(event) => {
+                        if (!ordered || draggedCallOrderIndex === null) return;
+                        event.preventDefault();
+                        event.dataTransfer.dropEffect = "move";
+                      }}
+                      onDrop={(event) => {
+                        if (!ordered) return;
+                        event.preventDefault();
+                        dropCallOrderItem(orderIndex);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.currentTarget !== event.target) return;
+                        if (ordered && event.key === "ArrowUp") {
+                          event.preventDefault();
+                          moveCallOrderItem(orderIndex, -1);
+                        } else if (ordered && event.key === "ArrowDown") {
+                          event.preventDefault();
+                          moveCallOrderItem(orderIndex, 1);
+                        } else if ((event.key === "Enter" || event.key === " ") && preset) {
+                          event.preventDefault();
+                          selectPreset(preset);
+                        }
+                      }}
+                      className={cn(
+                        "group relative flex min-h-[76px] select-none items-center gap-3 px-4 py-3 outline-none transition-[background-color,opacity] duration-150 sm:px-5",
+                        ordered &&
+                          (callOrderBusy
+                            ? "cursor-wait"
+                            : "cursor-grab active:cursor-grabbing"),
+                        "hover:bg-muted/25",
+                        isDropTarget &&
+                          !dropAfterTarget &&
+                          "before:absolute before:inset-x-4 before:top-0 before:z-10 before:h-0.5 before:rounded-full before:bg-foreground sm:before:inset-x-5",
+                        isDropTarget &&
+                          dropAfterTarget &&
+                          "after:absolute after:inset-x-4 after:bottom-0 after:z-10 after:h-0.5 after:rounded-full after:bg-foreground sm:after:inset-x-5",
+                        ordered && draggedCallOrderIndex === orderIndex && "opacity-35",
+                        "focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                      )}
+                    >
+                      {ordered ? (
+                        <GripVertical
+                          className="pointer-events-none h-4 w-4 shrink-0 text-muted-foreground/40 transition-colors group-hover:text-muted-foreground"
+                          aria-hidden
+                        />
+                      ) : (
+                        <span className="h-4 w-4 shrink-0" aria-hidden />
+                      )}
+                      <button
+                        type="button"
+                        aria-pressed={selectedPreset?.name === name}
+                        aria-expanded={selectedPreset?.name === name && editorOpen}
+                        disabled={!preset}
+                        onClick={() => preset && selectPreset(preset)}
+                        className="flex min-w-0 flex-1 items-center gap-3 rounded-[12px] text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        {ordered ? (
+                          <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-muted font-mono text-[11px] font-semibold tabular-nums text-muted-foreground">
+                            {orderIndex + 1}
+                          </span>
+                        ) : (
+                          <span className="h-7 w-7 shrink-0" aria-hidden />
+                        )}
+                        <ProviderPickerIcon
+                          provider={provider}
+                          showBrandLogos={showBrandLogos}
+                          unconfigured={!presetConfigured}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex min-w-0 flex-wrap items-center gap-2">
+                            <span className="truncate text-[14px] font-medium text-foreground">
+                              {preset?.label ?? name}
+                            </span>
+                            {orderIndex === 0 ? (
+                              <StatusPill tone="success">
+                                {tx("settings.models.primary", "Primary")}
+                              </StatusPill>
+                            ) : !ordered ? (
+                              <StatusPill tone="neutral">
+                                {tx("settings.models.disabled", "Disabled")}
+                              </StatusPill>
+                            ) : null}
+                            {!presetConfigured ? (
+                              <span className="text-[11px] font-medium text-amber-700 dark:text-amber-300">
+                                {tx(
+                                  "settings.models.providerSetupRequired",
+                                  "Provider setup required",
+                                )}
+                              </span>
+                            ) : null}
+                          </span>
+                          <span className="mt-0.5 block truncate text-[12px] text-muted-foreground">
+                            {preset?.model ?? name}
+                          </span>
+                        </span>
+                        <ChevronRight
+                          className={cn(
+                            "h-4 w-4 shrink-0 text-muted-foreground transition-transform",
+                            selectedPreset?.name === name && editorOpen && "rotate-90",
+                          )}
+                          aria-hidden
+                        />
+                      </button>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={ordered}
+                        aria-label={
+                          ordered
+                            ? tx("settings.models.removeFromOrder", "Disable preset")
+                            : tx("settings.models.addToOrder", "Enable preset")
+                        }
+                        disabled={callOrderBusy || (ordered && callOrder.length <= 1)}
+                        onClick={() => {
+                          if (ordered) {
+                            removeCallOrderItem(orderIndex);
+                          } else if (preset) {
+                            onChangeCallOrder([...callOrder, preset.name]);
+                          }
+                        }}
+                        className={cn(
+                          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-40",
+                          ordered ? "bg-foreground" : "bg-muted-foreground/25",
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            "h-4 w-4 rounded-full bg-background shadow-sm transition-transform",
+                            ordered ? "translate-x-[18px]" : "translate-x-0.5",
+                          )}
+                          aria-hidden
+                        />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="flex min-h-[58px] flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+                {!creating ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="rounded-full"
+                    disabled={callOrderBusy}
+                    onClick={() => {
+                      setEditorOpen(true);
+                      onBeginCreate();
+                    }}
+                  >
+                    <Plus className="mr-1.5 h-3.5 w-3.5" aria-hidden />
+                    {tx("settings.models.newPreset", "New model preset")}
+                  </Button>
+                ) : (
+                  <span />
+                )}
+                {orderSaving ? (
+                  <SettingsStatusMessage>
+                    <span className="inline-flex items-center gap-1.5">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                      {tx("settings.actions.saving", "Saving...")}
+                    </span>
+                  </SettingsStatusMessage>
+                ) : null}
+              </div>
+            </>
+          )}
+
+      {editorOpen && (selectedPreset || creating) ? (
+        <>
+            <div className="flex min-h-[52px] items-center justify-between gap-3 bg-muted/15 px-4 py-3 sm:px-5">
+              <span className="text-[13px] font-semibold text-foreground/85">
+                {creating
+                  ? tx("settings.models.newPreset", "New model preset")
+                  : tx("settings.models.editPreset", "Edit preset")}
+              </span>
+            </div>
+            <SettingsRow title={tx("settings.models.presetName", "Preset name")}>
               <Input
+                autoFocus={creating}
                 value={form.presetLabel}
+                placeholder={tx("settings.models.presetNamePlaceholder", "Fast writing")}
                 onChange={(event) =>
                   setForm((prev) => ({ ...prev, presetLabel: event.target.value }))
                 }
                 className="h-8 w-[min(280px,70vw)] rounded-full text-[13px]"
               />
             </SettingsRow>
-          ) : null}
-          <SettingsRow
-            title={t("settings.rows.provider")}
-            description={t("settings.help.provider")}
-          >
-            <ProviderPicker
-              providers={providerOptions}
-              value={providerValue}
-              emptyLabel={t("settings.byok.noConfiguredProviders")}
-              showProviderLogos={showBrandLogos}
-              onChange={(provider) =>
-                setForm((prev) => ({
-                  ...prev,
-                  provider,
-                  model: provider === prev.provider ? prev.model : "",
-                }))
-              }
-            />
-          </SettingsRow>
-          {selectedProviderNeedsSignIn ? (
-            <SettingsRow
-              title={tx("settings.oauth.signInRequired", "Sign in required")}
-              description={tx(
-                "settings.oauth.signInBeforeSaving",
-                "Sign in before saving this OAuth provider as the active model provider.",
-              )}
-            >
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => selectedProvider && onProviderOAuthLogin(selectedProvider.name)}
-                disabled={!selectedProvider?.oauth_login_supported || selectedProviderSigningIn}
-                className="rounded-full"
-              >
-                {selectedProviderSigningIn ? (
-                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
-                ) : null}
-                {selectedProviderSigningIn
-                  ? tx("settings.oauth.signingIn", "Signing in...")
-                  : tx("settings.oauth.signIn", "Sign in")}
-              </Button>
+            <SettingsRow title={t("settings.rows.provider")}>
+              <ProviderPicker
+                providers={providerOptions}
+                value={providerValue}
+                emptyLabel={t("settings.byok.noConfiguredProviders")}
+                showProviderLogos={showBrandLogos}
+                onChange={(provider) =>
+                  setForm((prev) => ({
+                    ...prev,
+                    provider,
+                    model: provider === prev.provider ? prev.model : "",
+                  }))
+                }
+              />
             </SettingsRow>
-          ) : null}
-          <SettingsRow
-            title={t("settings.rows.model")}
-            description={t("settings.help.model")}
-          >
-            <ModelIdPicker
-              token={token}
-              settings={settings}
-              provider={form.provider}
-              value={form.model}
-              showProviderLogos={showBrandLogos}
-              onChange={(model) => setForm((prev) => ({ ...prev, model }))}
-            />
-          </SettingsRow>
-          <SettingsRow
-            title={tx("settings.rows.contextWindow", "Context window")}
-            description={tx(
-              "settings.help.contextWindow",
-              "Choose the default context budget for this model configuration.",
-            )}
-          >
-            <SegmentedControl
-              value={String(form.contextWindowTokens)}
-              options={CONTEXT_WINDOW_TOKEN_OPTIONS.map((tokens) => ({
-                value: String(tokens),
-                label: tokens === 262_144 ? "256K" : "64K",
-              }))}
-              onChange={(value) =>
-                setForm((prev) => ({
-                  ...prev,
-                  contextWindowTokens: normalizeContextWindowTokens(Number(value)),
-                }))
-              }
-            />
-          </SettingsRow>
-          <SettingsFooter
-            dirty={dirty}
-            saving={saving}
-            saved={false}
-            disabled={selectedProviderNeedsSignIn || modelFieldsMissing}
-            message={
-              selectedProviderNeedsSignIn
-                ? tx("settings.oauth.signInBeforeSaving", "Sign in before saving this OAuth provider as the active model provider.")
-                : undefined
-            }
-            onSave={onSave}
-          />
+            {selectedProviderNeedsSignIn ? (
+              <SettingsRow
+                title={tx("settings.oauth.signInRequired", "Sign in required")}
+                description={tx(
+                  "settings.oauth.signInBeforeSaving",
+                  "Sign in before saving this provider in the preset.",
+                )}
+              >
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => selectedProvider && onProviderOAuthLogin(selectedProvider.name)}
+                  disabled={!selectedProvider?.oauth_login_supported || selectedProviderSigningIn}
+                  className="rounded-full"
+                >
+                  {selectedProviderSigningIn ? (
+                    <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+                  ) : null}
+                  {selectedProviderSigningIn
+                    ? tx("settings.oauth.signingIn", "Signing in...")
+                    : tx("settings.oauth.signIn", "Sign in")}
+                </Button>
+              </SettingsRow>
+            ) : null}
+            <SettingsRow title={t("settings.rows.model")}>
+              <ModelIdPicker
+                token={token}
+                settings={settings}
+                provider={form.provider}
+                value={form.model}
+                showProviderLogos={showBrandLogos}
+                onChange={(model) => setForm((prev) => ({ ...prev, model }))}
+              />
+            </SettingsRow>
+            <button
+              type="button"
+              aria-expanded={advancedOpen}
+              onClick={() => setAdvancedOpen((value) => !value)}
+              className="flex min-h-[62px] w-full items-center justify-between gap-4 px-4 py-3.5 text-left transition-colors hover:bg-muted/30 sm:px-5"
+            >
+              <span>
+                <span className="block text-[14px] font-medium text-foreground">
+                  {tx("settings.models.advancedOptions", "Advanced options")}
+                </span>
+                <span className="mt-0.5 block text-[12px] text-muted-foreground">
+                  {tx(
+                    "settings.models.advancedSummary",
+                    "Context {{context}} · Max {{max}} tokens",
+                    {
+                      context: formatModelContextWindow(form.contextWindowTokens),
+                      max: formatContextWindow(form.maxTokens),
+                    },
+                  )}
+                </span>
+              </span>
+              <ChevronDown
+                className={cn(
+                  "h-4 w-4 shrink-0 text-muted-foreground transition-transform",
+                  advancedOpen && "rotate-180",
+                )}
+                aria-hidden
+              />
+            </button>
+            {advancedOpen ? (
+              <div className="bg-muted/12 px-4 py-4 sm:px-5">
+                <ModelAdvancedFields
+                  maxTokens={form.maxTokens}
+                  contextWindowTokens={form.contextWindowTokens}
+                  temperature={form.temperature}
+                  reasoningEffort={form.reasoningEffort}
+                  onChange={(value) => setForm((prev) => ({ ...prev, ...value }))}
+                />
+              </div>
+            ) : null}
+            <div className="flex min-h-[58px] flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+              {creating ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="self-start rounded-full text-muted-foreground"
+                  disabled={creatingSaving}
+                  onClick={() => {
+                    setEditorOpen(false);
+                    onCancelCreate();
+                  }}
+                >
+                  {tx("settings.actions.cancel", "Cancel")}
+                </Button>
+              ) : selectedPreset ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="self-start rounded-full text-muted-foreground hover:text-destructive"
+                  disabled={selectedPresetReferenced || saving || orderSaving}
+                  title={
+                    selectedPresetReferenced
+                      ? tx(
+                          "settings.models.removeBeforeDelete",
+                          "Remove this preset from the call order before deleting it.",
+                        )
+                      : undefined
+                  }
+                  onClick={() => onDeleteConfiguration(selectedPreset)}
+                >
+                  <Trash2 className="mr-1.5 h-3.5 w-3.5" aria-hidden />
+                  {tx("settings.actions.delete", "Delete")}
+                </Button>
+              ) : null}
+              <div className="flex items-center justify-end gap-3">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="rounded-full"
+                  disabled={
+                    (!creating && !dirty) ||
+                    !selectedProviderConfigured ||
+                    modelFieldsMissing ||
+                    saving ||
+                    orderSaving
+                  }
+                  onClick={onSave}
+                >
+                  {saving || creatingSaving
+                    ? tx("settings.actions.saving", "Saving...")
+                    : tx("settings.actions.savePreset", "Save preset")}
+                </Button>
+              </div>
+            </div>
+          </>
+      ) : null}
         </SettingsGroup>
       </section>
     </div>
   );
 }
 
+function ModelAdvancedFields({
+  maxTokens,
+  contextWindowTokens,
+  temperature,
+  reasoningEffort,
+  onChange,
+}: {
+  maxTokens: number;
+  contextWindowTokens: number;
+  temperature: number;
+  reasoningEffort: string;
+  onChange: (
+    value: Partial<
+      Pick<
+        AgentSettingsDraft,
+        "maxTokens" | "contextWindowTokens" | "temperature" | "reasoningEffort"
+      >
+    >,
+  ) => void;
+}) {
+  const { t } = useTranslation();
+  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
+  const contextWindowOptions = Array.from(
+    new Set([...CONTEXT_WINDOW_TOKEN_OPTIONS, contextWindowTokens]),
+  ).sort((left, right) => left - right);
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <label className="block">
+          <span className="mb-1.5 block text-[12px] font-medium text-muted-foreground">
+            {tx("settings.models.maxTokens", "Max output tokens")}
+          </span>
+          <Input
+            type="number"
+            min={1}
+            step={1}
+            value={maxTokens}
+            onChange={(event) => {
+              const value = Number(event.target.value);
+              if (Number.isFinite(value)) onChange({ maxTokens: value });
+            }}
+            className="h-9 rounded-[12px] text-[13px]"
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1.5 block text-[12px] font-medium text-muted-foreground">
+            {tx("settings.models.temperature", "Temperature")}
+          </span>
+          <Input
+            type="number"
+            min={0}
+            max={2}
+            step={0.1}
+            value={temperature}
+            onChange={(event) => {
+              const value = Number(event.target.value);
+              if (Number.isFinite(value)) onChange({ temperature: value });
+            }}
+            className="h-9 rounded-[12px] text-[13px]"
+          />
+        </label>
+      </div>
+      <div>
+        <span className="mb-2 block text-[12px] font-medium text-muted-foreground">
+          {tx("settings.rows.contextWindow", "Context window")}
+        </span>
+        <SegmentedControl
+          value={String(contextWindowTokens)}
+          options={contextWindowOptions.map((tokens) => ({
+            value: String(tokens),
+            label: formatModelContextWindow(tokens),
+          }))}
+          onChange={(value) =>
+            onChange({ contextWindowTokens: normalizeContextWindowTokens(Number(value)) })
+          }
+        />
+      </div>
+      <label className="block">
+        <span className="mb-1.5 block text-[12px] font-medium text-muted-foreground">
+          {tx("settings.models.reasoningEffort", "Reasoning effort")}
+        </span>
+        <Input
+          value={reasoningEffort}
+          onChange={(event) => onChange({ reasoningEffort: event.target.value })}
+          placeholder={tx("settings.values.default", "Default")}
+          autoCapitalize="none"
+          spellCheck={false}
+          className="h-9 rounded-[12px] text-[13px]"
+        />
+      </label>
+    </div>
+  );
+}
+
+function ProviderAdvancedOptions({
+  fields,
+  form,
+  onChange,
+  footer,
+}: {
+  fields: ProviderAdvancedField[];
+  form: ProviderForm;
+  onChange: (value: Partial<ProviderForm>) => void;
+  footer?: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const enabled = new Set(fields);
+  if (enabled.size === 0) return null;
+
+  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
+  const thinkingStyleOptions = [
+    { value: "", label: tx("settings.values.default", "Default") },
+    { value: "thinking_type", label: "thinking_type" },
+    { value: "enable_thinking", label: "enable_thinking" },
+    { value: "reasoning_split", label: "reasoning_split" },
+  ];
+
+  return (
+    <div className="border-y border-border/45">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        className="flex min-h-[48px] w-full items-center justify-between gap-4 px-1 py-2.5 text-left transition-colors hover:text-foreground"
+      >
+        <span className="text-[13px] font-medium text-foreground">
+          {tx("settings.providers.advancedOptions", "Advanced options")}
+        </span>
+        <ChevronDown
+          className={cn(
+            "h-4 w-4 shrink-0 text-muted-foreground transition-transform",
+            open && "rotate-180",
+          )}
+          aria-hidden
+        />
+      </button>
+      {open ? (
+        <div className="border-t border-border/45 py-3">
+          <div className="grid gap-3 md:grid-cols-2">
+            {enabled.has("api_type") ? (
+              <label className="block space-y-1.5">
+                <span className="text-[12px] font-medium text-muted-foreground">
+                  {tx("settings.providers.apiType", "API type")}
+                </span>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="h-9 w-full justify-between rounded-full px-3 text-[13px]"
+                    >
+                      <span>
+                        {OPENAI_API_TYPE_OPTIONS.find(
+                          (option) => option.value === form.apiType,
+                        )?.label ?? form.apiType}
+                      </span>
+                      <ChevronDown
+                        className="h-3.5 w-3.5 text-muted-foreground"
+                        aria-hidden
+                      />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="min-w-[220px]">
+                    {OPENAI_API_TYPE_OPTIONS.map((option) => (
+                      <DropdownMenuItem
+                        key={option.value}
+                        onSelect={() => onChange({ apiType: option.value })}
+                      >
+                        {option.label}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </label>
+            ) : null}
+            {enabled.has("thinking_style") ? (
+              <label className="block space-y-1.5">
+                <span className="text-[12px] font-medium text-muted-foreground">
+                  {tx("settings.providers.thinkingStyle", "Thinking style")}
+                </span>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="h-9 w-full justify-between rounded-full px-3 text-[13px]"
+                    >
+                      <span className="font-mono text-[12px]">
+                        {thinkingStyleOptions.find(
+                          (option) => option.value === form.thinkingStyle,
+                        )?.label ?? form.thinkingStyle}
+                      </span>
+                      <ChevronDown
+                        className="h-3.5 w-3.5 text-muted-foreground"
+                        aria-hidden
+                      />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="min-w-[220px]">
+                    {thinkingStyleOptions.map((option) => (
+                      <DropdownMenuItem
+                        key={option.value || "default"}
+                        onSelect={() => onChange({ thinkingStyle: option.value })}
+                        className="font-mono text-[12px]"
+                      >
+                        {option.label}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </label>
+            ) : null}
+            {enabled.has("proxy") ? (
+              <label className="block space-y-1.5 md:col-span-2">
+                <span className="text-[12px] font-medium text-muted-foreground">
+                  {tx("settings.providers.proxy", "Network proxy")}
+                </span>
+                <Input
+                  value={form.proxy}
+                  onChange={(event) => onChange({ proxy: event.target.value })}
+                  placeholder="http://127.0.0.1:7890"
+                  autoCapitalize="none"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  className="h-9 rounded-full font-mono text-[12px]"
+                />
+              </label>
+            ) : null}
+            {enabled.has("region") ? (
+              <label className="block space-y-1.5">
+                <span className="text-[12px] font-medium text-muted-foreground">
+                  {tx("settings.providers.region", "Region")}
+                </span>
+                <Input
+                  value={form.region}
+                  onChange={(event) => onChange({ region: event.target.value })}
+                  placeholder="us-east-1"
+                  autoCapitalize="none"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  className="h-9 rounded-full font-mono text-[12px]"
+                />
+              </label>
+            ) : null}
+            {enabled.has("profile") ? (
+              <label className="block space-y-1.5">
+                <span className="text-[12px] font-medium text-muted-foreground">
+                  {tx("settings.providers.profile", "Profile")}
+                </span>
+                <Input
+                  value={form.profile}
+                  onChange={(event) => onChange({ profile: event.target.value })}
+                  placeholder="default"
+                  autoCapitalize="none"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  className="h-9 rounded-full font-mono text-[12px]"
+                />
+              </label>
+            ) : null}
+            {enabled.has("extra_headers") ? (
+              <label className="block min-w-0 space-y-1.5">
+                <span className="text-[12px] font-medium text-muted-foreground">
+                  {tx("settings.providers.extraHeaders", "Extra headers")}
+                </span>
+                <Textarea
+                  value={form.extraHeaders}
+                  onChange={(event) => onChange({ extraHeaders: event.target.value })}
+                  placeholder={'{"X-Header":"value"}'}
+                  spellCheck={false}
+                  className="min-h-[88px] resize-y rounded-[14px] bg-background font-mono text-[12px]"
+                />
+              </label>
+            ) : null}
+            {enabled.has("extra_query") ? (
+              <label className="block min-w-0 space-y-1.5">
+                <span className="text-[12px] font-medium text-muted-foreground">
+                  {tx("settings.providers.extraQuery", "Extra query")}
+                </span>
+                <Textarea
+                  value={form.extraQuery}
+                  onChange={(event) => onChange({ extraQuery: event.target.value })}
+                  placeholder={'{"api-version":"2024-02-01"}'}
+                  spellCheck={false}
+                  className="min-h-[88px] resize-y rounded-[14px] bg-background font-mono text-[12px]"
+                />
+              </label>
+            ) : null}
+            {enabled.has("extra_body") ? (
+              <label className="block min-w-0 space-y-1.5 md:col-span-2">
+                <span className="text-[12px] font-medium text-muted-foreground">
+                  {tx("settings.providers.extraBody", "Extra body")}
+                </span>
+                <Textarea
+                  value={form.extraBody}
+                  onChange={(event) => onChange({ extraBody: event.target.value })}
+                  placeholder={'{"service_tier":"priority"}'}
+                  spellCheck={false}
+                  className="min-h-[96px] resize-y rounded-[14px] bg-background font-mono text-[12px]"
+                />
+              </label>
+            ) : null}
+          </div>
+          {footer ? (
+            <div className="mt-3 flex items-center justify-end gap-2 border-t border-border/45 pt-3">
+              {footer}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ProvidersSettings({
   settings,
+  nanobotFeatures,
+  featureAction,
+  capabilityError,
   expandedProvider,
   providerForms,
   visibleProviderKeys,
   editingProviderKeys,
   providerSaving,
-  query,
   showBrandLogos,
-  onQueryChange,
+  remoteBrowserAccess,
   onToggleProvider,
   onToggleProviderKey,
   onToggleProviderKeyEditing,
   onChangeProviderForm,
   onSaveProvider,
+  onCreateCustomProvider,
   onProviderOAuthLogin,
   onProviderOAuthLogout,
-  onResetProviderDraft,
   imageProviderRestartPending,
   onRestart,
   isRestarting,
 }: {
   settings: SettingsPayload;
+  nanobotFeatures: NanobotFeaturesPayload | null;
+  featureAction: string | null;
+  capabilityError: string | null;
   expandedProvider: string | null;
   providerForms: Record<string, ProviderForm>;
   visibleProviderKeys: Record<string, boolean>;
   editingProviderKeys: Record<string, boolean>;
   providerSaving: string | null;
-  query: string;
   showBrandLogos: boolean;
-  onQueryChange: (query: string) => void;
+  remoteBrowserAccess: boolean;
   onToggleProvider: (provider: string) => void;
   onToggleProviderKey: (provider: string) => void;
   onToggleProviderKeyEditing: (provider: string) => void;
   onChangeProviderForm: (provider: string, value: Partial<ProviderForm>) => void;
   onSaveProvider: (provider: string) => void;
+  onCreateCustomProvider: (draft: CustomProviderDraft) => Promise<boolean>;
   onProviderOAuthLogin: (provider: string) => void;
   onProviderOAuthLogout: (provider: string) => void;
-  onResetProviderDraft: (provider: string) => void;
   imageProviderRestartPending: boolean;
   onRestart?: () => void;
   isRestarting?: boolean;
 }) {
   const { t } = useTranslation();
   const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
+  const [creatingCustomProvider, setCreatingCustomProvider] = useState(false);
+  const [customProviderKeyVisible, setCustomProviderKeyVisible] = useState(false);
+  const [customProviderDraft, setCustomProviderDraft] = useState<CustomProviderDraft>(
+    emptyCustomProviderDraft,
+  );
   const configuredProviders = settings.providers.filter((provider) => provider.configured);
   const unconfiguredProviders = useMemo(
-    () => orderUnconfiguredProviders(settings.providers.filter((provider) => !provider.configured)),
+    () =>
+      orderUnconfiguredProviders(
+        settings.providers.filter(
+          (provider) => !provider.configured && provider.name !== "custom",
+        ),
+      ),
     [settings.providers],
   );
-  const filteredConfigured = filterProviders(configuredProviders, query);
-  const filteredUnconfigured = filterProviders(unconfiguredProviders, query);
+  const selectedUnconfiguredProvider =
+    unconfiguredProviders.find((provider) => provider.name === expandedProvider) ?? null;
+  const customProviderSaving = providerSaving === CUSTOM_PROVIDER_CREATION_KEY;
+  const toggleProvider = (providerName: string) => {
+    setCreatingCustomProvider(false);
+    onToggleProvider(providerName);
+  };
+  const beginCustomProviderCreation = () => {
+    if (expandedProvider) onToggleProvider(expandedProvider);
+    setCustomProviderDraft(emptyCustomProviderDraft());
+    setCustomProviderKeyVisible(false);
+    setCreatingCustomProvider(true);
+  };
+  const cancelCustomProviderCreation = () => {
+    setCreatingCustomProvider(false);
+    setCustomProviderDraft(emptyCustomProviderDraft());
+    setCustomProviderKeyVisible(false);
+  };
+  const saveCustomProvider = async () => {
+    if (customProviderSaving) return;
+    if (await onCreateCustomProvider(customProviderDraft)) {
+      cancelCustomProviderCreation();
+    }
+  };
   const renderProviderRow = (provider: SettingsPayload["providers"][number]) => {
     const expanded = expandedProvider === provider.name;
-    const form = providerForms[provider.name] ?? {
-      apiKey: "",
-      apiBase: provider.api_base ?? provider.default_api_base ?? "",
-      apiType: provider.api_type ?? "auto",
-    };
+    const form = providerForms[provider.name] ?? providerFormFromRow(provider);
     const saving = providerSaving === provider.name;
     const isOauthProvider = provider.auth_type === "oauth";
+    const supportsOauthAdvancedSettings =
+      isOauthProvider && OAUTH_PROXY_PROVIDERS.has(provider.name);
     const keyVisible = !!visibleProviderKeys[provider.name];
     const editingKey = !provider.configured || !!editingProviderKeys[provider.name];
     const apiKeyRequired = provider.api_key_required ?? true;
     const apiKey = form.apiKey.trim();
     const apiBase = form.apiBase.trim();
+    const advancedFields = provider.advanced_fields ?? [];
+    const oauthSettingsDirty = isOauthProvider && (
+      form.proxy.trim() !== (provider.proxy ?? "").trim()
+      || form.extraBody.trim() !== providerJsonValue(provider.extra_body).trim()
+    );
+    const oauthSettingsSaving = saving && oauthSettingsDirty;
+    const oauthActionBusy = saving && !oauthSettingsSaving;
     const missingRequiredApiKey = !isOauthProvider && apiKeyRequired && !provider.configured && !apiKey;
+    const hasOptionalProviderSetting = Boolean(
+      apiKey
+      || apiBase
+      || form.proxy.trim()
+      || form.extraHeaders.trim()
+      || form.extraBody.trim()
+      || form.extraQuery.trim()
+      || form.thinkingStyle.trim()
+      || form.region.trim()
+      || form.profile.trim(),
+    );
     const missingOptionalCredential =
-      !isOauthProvider && !apiKeyRequired && !provider.configured && !apiKey && !apiBase;
+      !isOauthProvider
+      && !apiKeyRequired
+      && !provider.configured
+      && !hasOptionalProviderSetting;
+    const supportName = provider.name === "bedrock"
+      ? "bedrock"
+      : provider.name === "azure_openai"
+        ? "azure"
+        : null;
+    const supportFeature = supportName
+      ? (nanobotFeatures?.features ?? []).find((feature) => feature.name === supportName)
+      : null;
     return (
       <div key={provider.name} className="divide-y divide-border/45">
         <button
           type="button"
-          onClick={() => onToggleProvider(provider.name)}
+          aria-expanded={expanded}
+          onClick={() => toggleProvider(provider.name)}
           className="flex min-h-[70px] w-full items-center justify-between gap-4 px-4 py-3 text-left transition-colors hover:bg-muted/35 sm:px-5"
         >
           <span className="flex min-w-0 items-center gap-3">
@@ -2470,191 +4188,252 @@ function ProvidersSettings({
               <span className="block truncate text-[15px] font-semibold leading-5 text-foreground">
                 {provider.label}
               </span>
-              <span className="block truncate text-[12px] text-muted-foreground">
-                {provider.api_base || provider.default_api_base || provider.name}
-              </span>
+              {provider.api_base ? (
+                <span className="block truncate text-[12px] text-muted-foreground">
+                  {provider.api_base}
+                </span>
+              ) : null}
             </span>
           </span>
-          <StatusPill tone={provider.configured ? "success" : "neutral"}>
-            {isOauthProvider
-              ? provider.configured
-                ? tx("settings.oauth.signedIn", "Signed in")
-                : tx("settings.oauth.notSignedIn", "Not signed in")
-              : provider.configured
-                ? t("settings.byok.configured")
-                : t("settings.byok.notConfigured")}
-          </StatusPill>
+          <ChevronDown
+            className={cn(
+              "h-4 w-4 shrink-0 text-muted-foreground transition-transform",
+              expanded && "rotate-180",
+            )}
+            aria-hidden
+          />
         </button>
 
         {expanded ? (
           <div className="space-y-3 bg-muted/18 px-4 py-4 sm:px-5">
+            {supportFeature && !supportFeature.installed ? (
+              <CapabilityInstallNotice
+                title={tx("settings.capabilities.providerSupport", "Provider support")}
+                description={tx(
+                  "settings.capabilities.providerInstallOnSave",
+                  "Required support will be installed automatically when you save this provider.",
+                )}
+                installing={featureAction === `enable:${supportName}`}
+              />
+            ) : null}
+            {supportName && capabilityError ? (
+              <p className="text-[12px] text-destructive">{capabilityError}</p>
+            ) : null}
             {isOauthProvider ? (
-              <div className="flex flex-col gap-3 rounded-[18px] border border-border/45 bg-background/75 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-                <div className="min-w-0">
-                  <p className="text-[13px] font-semibold text-foreground">
-                    {tx("settings.oauth.authentication", "OAuth authentication")}
-                  </p>
-                  <p className="mt-1 truncate text-[12px] text-muted-foreground">
-                    {provider.configured
-                      ? t("settings.oauth.signedInAs", {
-                          account: provider.oauth_account || provider.label,
-                          defaultValue: "Signed in as {{account}}",
-                        })
-                      : tx("settings.oauth.signInHelp", "Sign in from this device; no API key is stored in config.")}
-                  </p>
-                </div>
-                <div className="flex shrink-0 justify-end gap-2">
-                  {provider.configured ? (
+              <>
+                <div className="flex flex-col gap-3 rounded-[18px] border border-border/45 bg-background/75 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <p className="text-[13px] font-semibold text-foreground">
+                      {tx("settings.oauth.authentication", "OAuth authentication")}
+                    </p>
+                    <p className="mt-1 text-[12px] text-muted-foreground">
+                      {provider.configured
+                        ? t("settings.oauth.signedInAs", {
+                            account: provider.oauth_account || provider.label,
+                            defaultValue: "Signed in as {{account}}",
+                          })
+                        : provider.name === "xai_grok" && remoteBrowserAccess
+                          ? tx(
+                              "settings.oauth.remoteSignInHelp",
+                              "Select Sign in to open xAI on your computer, then paste the authorization code shown after login.",
+                            )
+                          : tx("settings.oauth.signInHelp", "Sign in from this device; no API key is stored in config.")}
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 justify-end gap-2">
+                    {provider.configured ? (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => onProviderOAuthLogout(provider.name)}
+                        disabled={saving}
+                        className="rounded-full"
+                      >
+                        {tx("settings.oauth.signOut", "Sign out")}
+                      </Button>
+                    ) : null}
                     <Button
                       size="sm"
-                      variant="ghost"
-                      onClick={() => onProviderOAuthLogout(provider.name)}
-                      disabled={saving}
+                      variant="outline"
+                      onClick={() => onProviderOAuthLogin(provider.name)}
+                      disabled={saving || oauthSettingsDirty || !provider.oauth_login_supported}
+                      title={
+                        oauthSettingsDirty
+                          ? tx(
+                              "settings.providers.saveAdvancedBeforeSignIn",
+                              "Save advanced changes before signing in.",
+                            )
+                          : undefined
+                      }
                       className="rounded-full"
                     >
-                      {tx("settings.oauth.signOut", "Sign out")}
+                      {oauthActionBusy ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+                      ) : null}
+                      {oauthActionBusy
+                        ? tx("settings.oauth.signingIn", "Signing in...")
+                        : provider.configured
+                          ? tx("settings.oauth.signInAgain", "Sign in again")
+                          : tx("settings.oauth.signIn", "Sign in")}
                     </Button>
-                  ) : null}
+                  </div>
+                </div>
+                {supportsOauthAdvancedSettings ? (
+                  <ProviderAdvancedOptions
+                    fields={advancedFields}
+                    form={form}
+                    onChange={(value) => onChangeProviderForm(provider.name, value)}
+                    footer={
+                      <>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => toggleProvider(provider.name)}
+                          disabled={saving}
+                          className="rounded-full"
+                        >
+                          {t("settings.actions.cancel")}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => onSaveProvider(provider.name)}
+                          disabled={saving || !oauthSettingsDirty}
+                          className="rounded-full"
+                        >
+                          {oauthSettingsSaving ? (
+                            <Loader2
+                              className="mr-1.5 h-3.5 w-3.5 animate-spin"
+                              aria-hidden
+                            />
+                          ) : null}
+                          {oauthSettingsSaving
+                            ? t("settings.actions.saving")
+                            : tx("settings.providers.saveProvider", "Save provider")}
+                        </Button>
+                      </>
+                    }
+                  />
+                ) : null}
+              </>
+            ) : (
+              <>
+                {provider.is_custom ? (
+                  <label className="block space-y-1.5">
+                    <span className="text-[12px] font-medium text-muted-foreground">
+                      {tx("settings.providers.customProviderName", "Provider name")}
+                    </span>
+                    <Input
+                      value={form.displayName}
+                      onChange={(event) =>
+                        onChangeProviderForm(provider.name, { displayName: event.target.value })
+                      }
+                      className="h-9 rounded-full text-[13px]"
+                    />
+                  </label>
+                ) : null}
+                <label className="block space-y-1.5">
+                  <span className="text-[12px] font-medium text-muted-foreground">
+                    {t("settings.byok.apiKey")}
+                  </span>
+                  <div className="relative">
+                    {editingKey ? (
+                      <>
+                        <Input
+                          type={keyVisible ? "text" : "password"}
+                          value={form.apiKey}
+                          onChange={(event) =>
+                            onChangeProviderForm(provider.name, { apiKey: event.target.value })
+                          }
+                          placeholder={
+                            provider.configured
+                              ? t("settings.byok.apiKeyConfiguredPlaceholder")
+                              : t("settings.byok.apiKeyPlaceholder")
+                          }
+                          className="h-9 rounded-full pr-11 text-[13px]"
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => onToggleProviderKey(provider.name)}
+                          aria-label={
+                            keyVisible
+                              ? t("settings.byok.hideApiKey")
+                              : t("settings.byok.showApiKey")
+                          }
+                          className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
+                        >
+                          {keyVisible ? (
+                            <EyeOff className="h-3.5 w-3.5" aria-hidden />
+                          ) : (
+                            <Eye className="h-3.5 w-3.5" aria-hidden />
+                          )}
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <div className="flex h-9 items-center rounded-full border border-input bg-background px-3 pr-11 text-[13px] text-muted-foreground">
+                          {provider.api_key_hint ?? t("settings.byok.configuredKeyHint")}
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => onToggleProviderKeyEditing(provider.name)}
+                          aria-label={t("settings.actions.edit")}
+                          className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
+                        >
+                          <Pencil className="h-3.5 w-3.5" aria-hidden />
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                </label>
+                <label className="block space-y-1.5">
+                  <span className="text-[12px] font-medium text-muted-foreground">
+                    {t("settings.byok.apiBase")}
+                  </span>
+                  <Input
+                    value={form.apiBase}
+                    onChange={(event) =>
+                      onChangeProviderForm(provider.name, { apiBase: event.target.value })
+                    }
+                    placeholder={provider.default_api_base ?? t("settings.byok.apiBasePlaceholder")}
+                    className="h-9 rounded-full text-[13px]"
+                  />
+                </label>
+                <ProviderAdvancedOptions
+                  fields={advancedFields}
+                  form={form}
+                  onChange={(value) => onChangeProviderForm(provider.name, value)}
+                />
+                <div className="flex items-center justify-end gap-2">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => toggleProvider(provider.name)}
+                    className="rounded-full"
+                  >
+                    {t("settings.actions.cancel")}
+                  </Button>
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => onProviderOAuthLogin(provider.name)}
-                    disabled={saving || !provider.oauth_login_supported}
+                    onClick={() => onSaveProvider(provider.name)}
+                    disabled={
+                      saving
+                      || missingRequiredApiKey
+                      || missingOptionalCredential
+                      || (provider.is_custom && !form.displayName.trim())
+                    }
                     className="rounded-full"
                   >
-                    {saving ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
                     {saving
-                      ? tx("settings.oauth.signingIn", "Signing in...")
-                      : provider.configured
-                        ? tx("settings.oauth.signInAgain", "Sign in again")
-                        : tx("settings.oauth.signIn", "Sign in")}
+                      ? t("settings.actions.saving")
+                      : tx("settings.providers.saveProvider", "Save provider")}
                   </Button>
                 </div>
-              </div>
-            ) : (
-              <>
-            <label className="block space-y-1.5">
-              <span className="text-[12px] font-medium text-muted-foreground">
-                {t("settings.byok.apiKey")}
-              </span>
-              <div className="relative">
-                {editingKey ? (
-                  <>
-                    <Input
-                      type={keyVisible ? "text" : "password"}
-                      value={form.apiKey}
-                      onChange={(event) =>
-                        onChangeProviderForm(provider.name, { apiKey: event.target.value })
-                      }
-                      placeholder={
-                        provider.configured
-                          ? t("settings.byok.apiKeyConfiguredPlaceholder")
-                          : t("settings.byok.apiKeyPlaceholder")
-                      }
-                      className="h-9 rounded-full pr-11 text-[13px]"
-                    />
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => onToggleProviderKey(provider.name)}
-                      aria-label={
-                        keyVisible
-                          ? t("settings.byok.hideApiKey")
-                          : t("settings.byok.showApiKey")
-                      }
-                      className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
-                    >
-                      {keyVisible ? (
-                        <EyeOff className="h-3.5 w-3.5" aria-hidden />
-                      ) : (
-                        <Eye className="h-3.5 w-3.5" aria-hidden />
-                      )}
-                    </Button>
-                  </>
-                ) : (
-                  <>
-                    <div className="flex h-9 items-center rounded-full border border-input bg-background px-3 pr-11 text-[13px] text-muted-foreground">
-                      {provider.api_key_hint ?? t("settings.byok.configuredKeyHint")}
-                    </div>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => onToggleProviderKeyEditing(provider.name)}
-                      aria-label={t("settings.actions.edit")}
-                      className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
-                    >
-                      <Pencil className="h-3.5 w-3.5" aria-hidden />
-                    </Button>
-                  </>
-                )}
-              </div>
-            </label>
-            <label className="block space-y-1.5">
-              <span className="text-[12px] font-medium text-muted-foreground">
-                {t("settings.byok.apiBase")}
-              </span>
-              <Input
-                value={form.apiBase}
-                onChange={(event) =>
-                  onChangeProviderForm(provider.name, { apiBase: event.target.value })
-                }
-                placeholder={provider.default_api_base ?? t("settings.byok.apiBasePlaceholder")}
-                className="h-9 rounded-full text-[13px]"
-              />
-            </label>
-            {provider.name === "openai" ? (
-              <label className="block space-y-1.5">
-                <span className="text-[12px] font-medium text-muted-foreground">
-                  {tx("settings.byok.apiType", "API type")}
-                </span>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      className="h-9 w-full justify-between rounded-full px-3 text-[13px]"
-                    >
-                      <span>
-                        {OPENAI_API_TYPE_OPTIONS.find((option) => option.value === form.apiType)?.label ??
-                          form.apiType}
-                      </span>
-                      <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" aria-hidden />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start" className="min-w-[220px]">
-                    {OPENAI_API_TYPE_OPTIONS.map((option) => (
-                      <DropdownMenuItem
-                        key={option.value}
-                        onSelect={() => onChangeProviderForm(provider.name, { apiType: option.value })}
-                      >
-                        {option.label}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </label>
-            ) : null}
-            <div className="flex items-center justify-end gap-2">
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => onResetProviderDraft(provider.name)}
-                className="rounded-full"
-              >
-                {t("settings.actions.cancel")}
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => onSaveProvider(provider.name)}
-                disabled={saving || missingRequiredApiKey || missingOptionalCredential}
-                className="rounded-full"
-              >
-                {saving ? t("settings.actions.saving") : tx("settings.providers.saveProvider", "Save provider")}
-              </Button>
-            </div>
               </>
             )}
           </div>
@@ -2662,15 +4441,149 @@ function ProvidersSettings({
       </div>
     );
   };
+  const customProviderForm = creatingCustomProvider ? (
+    <div className="divide-y divide-border/45">
+      <button
+        type="button"
+        aria-expanded
+        onClick={cancelCustomProviderCreation}
+        className="flex min-h-[70px] w-full items-center justify-between gap-4 px-4 py-3 text-left transition-colors hover:bg-muted/35 sm:px-5"
+      >
+        <span className="flex min-w-0 items-center gap-3">
+          <ProviderIcon provider="custom" showBrandLogos={showBrandLogos} />
+          <span className="truncate text-[15px] font-semibold text-foreground">
+            {tx("settings.providers.customProvider", "Custom provider")}
+          </span>
+        </span>
+        <ChevronDown
+          className="h-4 w-4 shrink-0 rotate-180 text-muted-foreground"
+          aria-hidden
+        />
+      </button>
+      <div className="space-y-3 bg-muted/18 px-4 py-4 sm:px-5">
+        <label className="block space-y-1.5">
+          <span className="text-[12px] font-medium text-muted-foreground">
+            {tx("settings.providers.customProviderName", "Provider name")}
+          </span>
+          <Input
+            autoFocus
+            value={customProviderDraft.name}
+            onChange={(event) =>
+              setCustomProviderDraft((current) => ({
+                ...current,
+                name: event.target.value,
+              }))
+            }
+            placeholder={tx(
+              "settings.providers.customProviderNamePlaceholder",
+              "My model provider",
+            )}
+            className="h-9 rounded-full text-[13px]"
+          />
+        </label>
+        <label className="block space-y-1.5">
+          <span className="text-[12px] font-medium text-muted-foreground">
+            {t("settings.byok.apiBase")}
+          </span>
+          <Input
+            value={customProviderDraft.apiBase}
+            onChange={(event) =>
+              setCustomProviderDraft((current) => ({
+                ...current,
+                apiBase: event.target.value,
+              }))
+            }
+            placeholder="https://api.example.com/v1"
+            autoCapitalize="none"
+            autoComplete="off"
+            autoCorrect="off"
+            spellCheck={false}
+            className="h-9 rounded-full text-[13px]"
+          />
+        </label>
+        <label className="block space-y-1.5">
+          <span className="text-[12px] font-medium text-muted-foreground">
+            {t("settings.byok.apiKey")}
+          </span>
+          <div className="relative">
+            <Input
+              type={customProviderKeyVisible ? "text" : "password"}
+              value={customProviderDraft.apiKey}
+              onChange={(event) =>
+                setCustomProviderDraft((current) => ({
+                  ...current,
+                  apiKey: event.target.value,
+                }))
+              }
+              placeholder={t("settings.byok.apiKeyPlaceholder")}
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck={false}
+              className="h-9 rounded-full pr-11 text-[13px]"
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              onClick={() => setCustomProviderKeyVisible((visible) => !visible)}
+              aria-label={
+                customProviderKeyVisible
+                  ? t("settings.byok.hideApiKey")
+                  : t("settings.byok.showApiKey")
+              }
+              className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
+            >
+              {customProviderKeyVisible ? (
+                <EyeOff className="h-3.5 w-3.5" aria-hidden />
+              ) : (
+                <Eye className="h-3.5 w-3.5" aria-hidden />
+              )}
+            </Button>
+          </div>
+        </label>
+        <ProviderAdvancedOptions
+          fields={CUSTOM_PROVIDER_ADVANCED_FIELDS}
+          form={customProviderDraft}
+          onChange={(value) =>
+            setCustomProviderDraft((current) => ({ ...current, ...value }))
+          }
+        />
+        <div className="flex items-center justify-end gap-2">
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={cancelCustomProviderCreation}
+            disabled={customProviderSaving}
+            className="rounded-full"
+          >
+            {t("settings.actions.cancel")}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={saveCustomProvider}
+            disabled={
+              customProviderSaving ||
+              !customProviderDraft.name.trim() ||
+              !customProviderDraft.apiBase.trim()
+            }
+            className="rounded-full"
+          >
+            {customProviderSaving
+              ? t("settings.actions.saving")
+              : tx("settings.providers.saveProvider", "Save provider")}
+          </Button>
+        </div>
+      </div>
+    </div>
+  ) : null;
   return (
     <div className="space-y-6">
-      <p className="max-w-[42rem] text-[13px] leading-6 text-muted-foreground">
-        {t("settings.byok.description")}
-      </p>
       {imageProviderRestartPending && onRestart ? (
         <div className="flex min-h-[48px] items-center justify-between gap-3 border-y border-border/55 py-3">
           <p className="text-[13px] leading-5 text-muted-foreground">
-            {tx("settings.status.imageProviderRestart", "Image provider changes saved. Restart when ready.")}
+            {tx("settings.status.imageProviderRestart", "Provider support changed. Restart when ready.")}
           </p>
           <div className="shrink-0">
             <Button
@@ -2690,35 +4603,86 @@ function ProvidersSettings({
           </div>
         </div>
       ) : null}
-      <div className="relative">
-        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
-        <Input
-          value={query}
-          onChange={(event) => onQueryChange(event.target.value)}
-          placeholder={tx("settings.providers.searchPlaceholder", "Search providers")}
-          className="h-10 rounded-full pl-9 text-[13px]"
-        />
-      </div>
-      <ProviderSection
-        title={t("settings.byok.configuredSection")}
-        count={filteredConfigured.length}
-        empty={t("settings.byok.noConfiguredProviders")}
-      >
-        {filteredConfigured.map(renderProviderRow)}
-      </ProviderSection>
-      <ProviderSection
-        title={t("settings.byok.notConfiguredSection")}
-        count={filteredUnconfigured.length}
-        empty={tx("settings.providers.noMatches", "No providers match this search.")}
-      >
-        {filteredUnconfigured.map(renderProviderRow)}
-      </ProviderSection>
-      <ThirdPartyBrandNotice />
+      <section>
+        <SettingsSectionTitle>
+          {tx("settings.providers.title", "Model providers")}
+        </SettingsSectionTitle>
+        <SettingsGroup>
+          {configuredProviders.map(renderProviderRow)}
+          {selectedUnconfiguredProvider
+            ? renderProviderRow(selectedUnconfiguredProvider)
+            : null}
+          {customProviderForm}
+          {!expandedProvider && !creatingCustomProvider ? (
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="group flex min-h-[70px] w-full items-center justify-between gap-4 px-4 py-3 text-left transition-colors hover:bg-muted/35 sm:px-5"
+                >
+                  <span className="flex min-w-0 items-center gap-3">
+                    <span className="grid h-10 w-10 shrink-0 place-items-center rounded-[14px] bg-muted text-muted-foreground">
+                      <Plus className="h-5 w-5" aria-hidden />
+                    </span>
+                    <span className="truncate text-[15px] font-semibold text-foreground">
+                      {tx(
+                        "settings.providers.addOwnProvider",
+                        "Add your own model provider",
+                      )}
+                    </span>
+                  </span>
+                  <ChevronDown
+                    className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-180"
+                    aria-hidden
+                  />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="end"
+                sideOffset={8}
+                className="max-h-[24rem] w-[380px] max-w-[calc(100vw-2rem)] overflow-y-auto rounded-[20px] border-border bg-popover p-1.5 shadow-none scrollbar-thin scrollbar-track-transparent"
+              >
+                <DropdownMenuItem
+                  onSelect={beginCustomProviderCreation}
+                  className="flex min-h-[54px] cursor-default items-center gap-3 rounded-[14px] px-2.5 py-2 focus:bg-muted/85 focus:text-foreground"
+                >
+                  <ProviderIcon provider="custom" showBrandLogos={showBrandLogos} />
+                  <span className="truncate text-[13px] font-medium">
+                    {tx("settings.providers.customProvider", "Custom provider")}
+                  </span>
+                </DropdownMenuItem>
+                {unconfiguredProviders.length > 0 ? <DropdownMenuSeparator /> : null}
+                {unconfiguredProviders.map((provider) => (
+                  <DropdownMenuItem
+                    key={provider.name}
+                    onSelect={() => {
+                      setCreatingCustomProvider(false);
+                      if (expandedProvider !== provider.name) {
+                        onToggleProvider(provider.name);
+                      }
+                    }}
+                    className="flex min-h-[54px] cursor-default items-center gap-3 rounded-[14px] px-2.5 py-2 focus:bg-muted/85 focus:text-foreground"
+                  >
+                    <ProviderIcon
+                      provider={provider.name}
+                      showBrandLogos={showBrandLogos}
+                    />
+                    <span className="truncate text-[13px] font-medium">
+                      {provider.label}
+                    </span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : null}
+        </SettingsGroup>
+      </section>
     </div>
   );
 }
 
 function ImageGenerationSettings({
+  token,
   settings,
   form,
   dirty,
@@ -2731,6 +4695,7 @@ function ImageGenerationSettings({
   isRestarting,
   requiresRestartPending,
 }: {
+  token: string;
   settings: SettingsPayload;
   form: ImageGenerationSettingsUpdate;
   dirty: boolean;
@@ -2758,6 +4723,14 @@ function ImageGenerationSettings({
     IMAGE_SIZE_OPTIONS.map((value) => ({ name: value, label: value })),
     form.defaultImageSize,
   );
+  const selectProvider = (provider: string) => {
+    const nextProvider = settings.image_generation.providers.find((row) => row.name === provider);
+    onChangeForm((prev) => ({
+      ...prev,
+      provider,
+      model: nextProvider?.default_model || nextProvider?.models?.[0] || prev.model,
+    }));
+  };
 
   return (
     <div className="space-y-7">
@@ -2784,7 +4757,7 @@ function ImageGenerationSettings({
               value={form.provider}
               emptyLabel={tx("settings.image.selectProvider", "Select provider")}
               showProviderLogos={showBrandLogos}
-              onChange={(provider) => onChangeForm((prev) => ({ ...prev, provider }))}
+              onChange={selectProvider}
             />
           </SettingsRow>
           <SettingsRow
@@ -2819,10 +4792,23 @@ function ImageGenerationSettings({
             title={tx("settings.rows.imageModel", "Image model")}
             description={tx("settings.help.imageModel", "Model name sent to the selected image provider.")}
           >
-            <Input
+            <ModelIdPicker
+              token={token}
+              settings={settings}
+              provider={form.provider}
+              models={selectedProvider?.models ?? []}
               value={form.model}
-              onChange={(event) => onChangeForm((prev) => ({ ...prev, model: event.target.value }))}
-              className="h-8 w-[min(300px,70vw)] rounded-full text-[13px]"
+              showProviderLogos={showBrandLogos}
+              emptyLabel={tx("settings.image.selectModel", "Select image model")}
+              searchPlaceholder={tx(
+                "settings.image.searchOrTypeModel",
+                "Search or type model ID",
+              )}
+              emptyMessage={tx(
+                "settings.image.typeModelId",
+                "Type the model ID supported by this provider.",
+              )}
+              onChange={(model) => onChangeForm((prev) => ({ ...prev, model }))}
             />
           </SettingsRow>
           <SettingsRow
@@ -3034,6 +5020,9 @@ function WebSettings({
   onRestart,
   isRestarting,
   requiresRestartPending,
+  olostepFeature,
+  olostepInstalling,
+  capabilityError,
 }: {
   settings: SettingsPayload;
   form: WebSearchSettingsUpdate;
@@ -3050,6 +5039,9 @@ function WebSettings({
   onRestart?: () => void;
   isRestarting?: boolean;
   requiresRestartPending: boolean;
+  olostepFeature?: NanobotFeatureInfo;
+  olostepInstalling: boolean;
+  capabilityError: string | null;
 }) {
   const { t } = useTranslation();
   const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
@@ -3057,10 +5049,10 @@ function WebSettings({
     settings.web_search.providers.find((provider) => provider.name === form.provider) ??
     settings.web_search.providers[0];
   const hasExistingSecret =
-    selectedProvider?.credential === "api_key" &&
+    webSearchProviderAcceptsApiKey(selectedProvider) &&
     form.provider === settings.web_search.provider &&
     !!settings.web_search.api_key_hint;
-  const showKeyInput = selectedProvider?.credential === "api_key" && (!hasExistingSecret || keyEditing);
+  const showKeyInput = webSearchProviderAcceptsApiKey(selectedProvider) && (!hasExistingSecret || keyEditing);
   const apiKey = form.apiKey?.trim() ?? "";
   const baseUrl = form.baseUrl?.trim() ?? "";
   const effectiveJinaReader = form.useJinaReader ?? settings.web.fetch.use_jina_reader;
@@ -3073,7 +5065,7 @@ function WebSettings({
     effectiveJinaReader !== settings.web.fetch.use_jina_reader;
   const jinaReaderDirty = effectiveJinaReader !== settings.web.fetch.use_jina_reader;
   const missingCredential =
-    selectedProvider?.credential === "api_key"
+    webSearchProviderRequiresApiKey(selectedProvider)
       ? !apiKey && !hasExistingSecret
       : selectedProvider?.credential === "base_url"
         ? !baseUrl
@@ -3083,6 +5075,21 @@ function WebSettings({
     <div className="space-y-7">
       <section>
         <SettingsSectionTitle>{tx("settings.sections.webSearch", "Web search")}</SettingsSectionTitle>
+        {form.provider === "olostep" && olostepFeature && !olostepFeature.installed ? (
+          <div className="mb-3">
+            <CapabilityInstallNotice
+              title={tx("settings.capabilities.searchSupport", "Search provider support")}
+              description={tx(
+                "settings.capabilities.searchInstallOnSave",
+                "Olostep support will be installed automatically when you save.",
+              )}
+              installing={olostepInstalling}
+            />
+          </div>
+        ) : null}
+        {capabilityError ? (
+          <p className="mb-3 text-[12px] text-destructive">{capabilityError}</p>
+        ) : null}
         <SettingsGroup>
           <SettingsRow
             title={t("settings.byok.webSearch.provider")}
@@ -3106,7 +5113,7 @@ function WebSettings({
             </SettingsRow>
           ) : null}
 
-          {selectedProvider?.credential === "api_key" ? (
+          {webSearchProviderAcceptsApiKey(selectedProvider) ? (
             <SettingsRow
               title={t("settings.byok.apiKey")}
               description={t("settings.byok.webSearch.apiKeyHelp")}
@@ -3247,6 +5254,1847 @@ function WebSettings({
   );
 }
 
+function AutomationsSettings({
+  payload,
+  loading,
+  query,
+  filter,
+  sort,
+  actionKey,
+  error,
+  onQueryChange,
+  onFilterChange,
+  onSortChange,
+  onAction,
+  onRequestEdit,
+  onRequestDelete,
+}: {
+  payload: AutomationsPayload | null;
+  loading: boolean;
+  query: string;
+  filter: AutomationFilter;
+  sort: AutomationSort;
+  actionKey: string | null;
+  error: string | null;
+  onQueryChange: (value: string) => void;
+  onFilterChange: (value: AutomationFilter) => void;
+  onSortChange: (value: AutomationSort) => void;
+  onAction: (action: AutomationAction, job: SessionAutomationJob) => void | Promise<void>;
+  onRequestEdit: (job: SessionAutomationJob) => void;
+  onRequestDelete: (job: SessionAutomationJob) => void;
+}) {
+  const { t, i18n } = useTranslation();
+  const tx = (key: string, fallback: string, values?: Record<string, unknown>) =>
+    t(key, { defaultValue: fallback, ...(values ?? {}) });
+  const jobs = payload?.jobs ?? [];
+  const locale = i18n.resolvedLanguage || i18n.language;
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const filtered = useMemo(() => {
+    const searchTokens = parseAutomationSearchQuery(query);
+    return sortAutomationJobs(jobs, sort)
+      .filter((job) => automationMatchesFilter(job, filter))
+      .filter((job) => !searchTokens.length || automationMatchesSearch(job, searchTokens));
+  }, [filter, jobs, query, sort]);
+  const activeCount = jobs.filter((job) => {
+    const key = automationStatusKey(job);
+    return key === "active" || key === "running";
+  }).length;
+  const pausedCount = jobs.filter((job) => automationStatusKey(job) === "paused").length;
+  const failedCount = jobs.filter(automationNeedsAttention).length;
+  const systemCount = jobs.filter((job) => job.protected).length;
+  const summaryOptions: Array<{ value: AutomationFilter; label: string; count: number }> = [
+    { value: "all", label: tx("settings.automations.filters.all", "All"), count: jobs.length },
+    { value: "active", label: tx("settings.automations.filters.active", "Active"), count: activeCount },
+    { value: "paused", label: tx("settings.automations.filters.paused", "Paused"), count: pausedCount },
+    { value: "failed", label: tx("settings.automations.filters.failed", "Needs attention"), count: failedCount },
+    { value: "system", label: tx("settings.automations.filters.system", "System"), count: systemCount },
+  ];
+  const sortLabel = {
+    next: tx("settings.automations.sort.next", "Next run"),
+    last: tx("settings.automations.sort.last", "Last run"),
+    updated: tx("settings.automations.sort.updated", "Updated"),
+    name: tx("settings.automations.sort.name", "Name"),
+  } satisfies Record<AutomationSort, string>;
+  const selectedJob = filtered.find((job) => job.id === selectedJobId) ?? filtered[0] ?? null;
+
+  useEffect(() => {
+    if (!filtered.length) {
+      if (selectedJobId !== null) setSelectedJobId(null);
+      return;
+    }
+    if (!selectedJobId || !filtered.some((job) => job.id === selectedJobId)) {
+      setSelectedJobId(filtered[0].id);
+    }
+  }, [filtered, selectedJobId]);
+
+  return (
+    <div className="space-y-5">
+      <section className="shrink-0">
+        <div className="mx-auto flex w-full max-w-[56rem] flex-col gap-3">
+          <div className="-mx-1 overflow-x-auto px-1 pb-0.5">
+            <div className="grid w-full min-w-[36rem] grid-cols-5 gap-1 rounded-[15px] bg-muted p-1">
+              {summaryOptions.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => onFilterChange(option.value)}
+                  className={cn(
+                    "inline-flex h-8 min-w-0 shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-[11px] px-3 text-[12px] font-medium text-muted-foreground transition-colors",
+                    filter === option.value && "bg-background text-foreground",
+                    automationFilterToneClass(option.value, option.count, filter === option.value),
+                  )}
+                >
+                  <span>{option.label}</span>
+                  <span
+                    className={cn(
+                      "min-w-5 shrink-0 rounded-full bg-background/75 px-1.5 py-0.5 text-center text-[11px] tabular-nums text-muted-foreground",
+                      automationFilterCountClass(option.value, option.count),
+                    )}
+                  >
+                    {option.count}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid min-w-0 gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+            <div className="relative min-w-0">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground/70" />
+              <Input
+                value={query}
+                onChange={(event) => onQueryChange(event.target.value)}
+                placeholder={tx(
+                  "settings.automations.search",
+                  "Search task, message, linked chat, or schedule",
+                )}
+                className={cn(
+                  "h-9 w-full rounded-[13px] pl-9 text-[13px]",
+                  SETTINGS_SEARCH_INPUT_CLASS,
+                )}
+              />
+            </div>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="inline-flex h-9 min-w-[8.5rem] items-center justify-center gap-1.5 whitespace-nowrap rounded-[13px] border border-border/45 bg-settings-surface px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground sm:w-auto"
+                >
+                  <ArrowUpDown className="h-3.5 w-3.5" aria-hidden />
+                  <span>{sortLabel[sort]}</span>
+                  <ChevronDown className="h-3.5 w-3.5" aria-hidden />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-40">
+                {(Object.keys(sortLabel) as AutomationSort[]).map((value) => (
+                  <DropdownMenuItem key={value} onClick={() => onSortChange(value)}>
+                    <span>{sortLabel[value]}</span>
+                    {sort === value ? <Check className="ml-auto h-3.5 w-3.5" aria-hidden /> : null}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+      </section>
+
+      {error ? (
+        <div className="flex items-center gap-2 rounded-[18px] border border-destructive/20 bg-destructive/5 px-4 py-3 text-[13px] text-destructive">
+          <CircleAlert className="h-4 w-4 shrink-0" aria-hidden />
+          <span>{error}</span>
+        </div>
+      ) : null}
+
+      {loading && !payload ? (
+        <div className="flex h-44 items-center justify-center rounded-[22px] bg-settings-surface text-[13px] text-muted-foreground">
+          <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden />
+          {tx("settings.automations.loading", "Loading automations...")}
+        </div>
+      ) : filtered.length && selectedJob ? (
+        <section className="grid min-h-0 overflow-hidden rounded-[22px] bg-settings-surface xl:grid-cols-[minmax(16rem,18rem)_minmax(0,1fr)] xl:items-stretch">
+          <aside className="flex min-h-0 flex-col overflow-hidden border-b border-border/35 bg-settings-surface xl:border-b-0 xl:border-r">
+            <div className="flex shrink-0 items-center justify-between gap-3 px-4 py-3">
+              <h2 className="text-[13px] font-semibold tracking-[-0.01em] text-foreground/85">
+                {tx("settings.automations.queue", "Queue")}
+              </h2>
+              <span className="rounded-full bg-orange-100/60 px-2 py-0.5 text-[11px] text-orange-800/70 tabular-nums dark:bg-orange-300/10 dark:text-orange-200/75">
+                {filtered.length}
+              </span>
+            </div>
+            <div
+              className="max-h-[28rem] space-y-1 overflow-y-auto overscroll-contain px-2 pb-2 xl:max-h-[calc(100vh-24rem)]"
+              role="list"
+              aria-label={tx("settings.automations.queue", "Queue")}
+            >
+              {filtered.map((job) => (
+                <AutomationListItem
+                  key={job.id}
+                  job={job}
+                  locale={locale}
+                  selected={job.id === selectedJob.id}
+                  onSelect={() => setSelectedJobId(job.id)}
+                />
+              ))}
+            </div>
+          </aside>
+          <AutomationDetailPanel
+            job={selectedJob}
+            locale={locale}
+            actionKey={actionKey}
+            onAction={onAction}
+            onRequestEdit={onRequestEdit}
+            onRequestDelete={onRequestDelete}
+          />
+        </section>
+      ) : (
+        <div className="rounded-[22px] bg-settings-surface px-5 py-12 text-center text-[13px] text-muted-foreground">
+          <div>
+            {jobs.length
+              ? tx("settings.automations.noMatches", "No automations match this view.")
+              : tx("settings.automations.empty", "No automations yet.")}
+          </div>
+          {!jobs.length ? (
+            <div className="mx-auto mt-2 max-w-[28rem] text-[12px] leading-5">
+              {tx(
+                "settings.automations.emptyHint",
+                "Create one from where it should run so nanobot keeps the right context.",
+              )}
+            </div>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AutomationListItem({
+  job,
+  locale,
+  selected,
+  onSelect,
+}: {
+  job: SessionAutomationJob;
+  locale: string;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const { t } = useTranslation();
+  const tx = (key: string, fallback: string, values?: Record<string, unknown>) =>
+    t(key, { defaultValue: fallback, ...(values ?? {}) });
+  const status = automationStatus(job, tx);
+  const origin = automationOriginLabel(job, tx);
+  const nextRun = formatAutomationNext(job, tx);
+  const summary = automationSummary(job, tx);
+
+  return (
+    <div role="listitem">
+      <button
+        type="button"
+        aria-pressed={selected}
+        onClick={onSelect}
+        className={cn(
+          "group grid w-full grid-cols-[minmax(0,1fr)_auto] gap-3 rounded-[18px] px-3 py-3.5 text-left transition-colors",
+          selected
+            ? "bg-background/80 text-foreground"
+            : "text-muted-foreground hover:bg-background/55 hover:text-foreground",
+        )}
+      >
+        <span className="min-w-0">
+          <span className="flex min-w-0 items-center gap-2.5">
+            <span
+              className={cn("h-2 w-2 shrink-0 rounded-full", automationStatusDotClass(job))}
+              aria-hidden
+            />
+            <span className="truncate text-[13.5px] font-medium text-foreground">
+              {job.name || job.id}
+            </span>
+          </span>
+          <span className="mt-1.5 line-clamp-2 text-[12px] leading-5 text-muted-foreground">
+            {summary}
+          </span>
+          <span className="mt-2.5 flex min-w-0 items-center gap-2 text-[11.5px] leading-none text-muted-foreground">
+            <span className="truncate" title={formatAutomationNextTitle(job, locale, tx)}>
+              {nextRun}
+            </span>
+            <span className="h-1 w-1 shrink-0 rounded-full bg-muted-foreground/35" aria-hidden />
+            <span className="truncate">{origin}</span>
+          </span>
+        </span>
+        <span className="flex shrink-0 flex-col items-end gap-2 pt-0.5">
+          <span className="rounded-full bg-background/70 px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+            {status.label}
+          </span>
+          {job.delete_after_run ? (
+            <span className="rounded-full bg-background/80 px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+              {tx("settings.automations.oneShot", "One-time")}
+            </span>
+          ) : null}
+          <ChevronRight
+            className={cn(
+              "h-3.5 w-3.5 text-muted-foreground/55 transition-opacity",
+              selected ? "opacity-100" : "opacity-0 group-hover:opacity-70",
+            )}
+            aria-hidden
+          />
+        </span>
+      </button>
+    </div>
+  );
+}
+
+function AutomationDetailPanel({
+  job,
+  locale,
+  actionKey,
+  onAction,
+  onRequestEdit,
+  onRequestDelete,
+}: {
+  job: SessionAutomationJob;
+  locale: string;
+  actionKey: string | null;
+  onAction: (action: AutomationAction, job: SessionAutomationJob) => void | Promise<void>;
+  onRequestEdit: (job: SessionAutomationJob) => void;
+  onRequestDelete: (job: SessionAutomationJob) => void;
+}) {
+  const { t } = useTranslation();
+  const tx = (key: string, fallback: string, values?: Record<string, unknown>) =>
+    t(key, { defaultValue: fallback, ...(values ?? {}) });
+  const status = automationStatus(job, tx);
+  const origin = automationOriginLabel(job, tx);
+  const originHref = job.origin?.channel === "websocket" && job.origin.session_key
+    ? `#/chat/${encodeURIComponent(job.origin.session_key)}`
+    : null;
+  const created = job.created_at_ms ? fmtDateTime(job.created_at_ms, locale) : null;
+  const updated = job.updated_at_ms ? fmtDateTime(job.updated_at_ms, locale) : null;
+  const localTrigger = isLocalTriggerAutomation(job);
+  const triggerCommand = automationTriggerCommand(job);
+  const message = automationDetailText(job, tx);
+  const messageLabel = localTrigger
+    ? tx("settings.automations.fields.command", "Command")
+    : tx("settings.automations.fields.message", "Message");
+  const schedule = formatAutomationSchedule(job, locale, tx);
+  const [messageExpanded, setMessageExpanded] = useState(false);
+  const [commandCopied, setCommandCopied] = useState(false);
+  const messageNeedsExpansion = automationMessageNeedsExpansion(message);
+
+  useEffect(() => {
+    setMessageExpanded(false);
+    setCommandCopied(false);
+  }, [job.id]);
+
+  return (
+    <article className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-settings-surface">
+      <div className="shrink-0 border-b border-border/35 px-4 py-3.5 dark:border-white/10 sm:px-5">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <h3 className="min-w-0 truncate text-[18px] font-medium leading-7 text-foreground">
+                {job.name || job.id}
+              </h3>
+              <AutomationStatusBadge tone={status.tone}>{status.label}</AutomationStatusBadge>
+              {job.delete_after_run ? (
+                <AutomationStatusBadge>{tx("settings.automations.oneShot", "One-time")}</AutomationStatusBadge>
+              ) : null}
+            </div>
+            <p className="mt-1 truncate text-[12.5px] leading-5 text-muted-foreground">
+              {schedule} · {origin}
+            </p>
+          </div>
+          <AutomationActionGroup
+            job={job}
+            actionKey={actionKey}
+            onAction={onAction}
+            onRequestEdit={onRequestEdit}
+            onRequestDelete={onRequestDelete}
+          />
+        </div>
+      </div>
+
+      <div className="grid min-h-0 min-w-0 flex-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_14.5rem]">
+        <div className="min-h-0 min-w-0 space-y-3 overflow-y-auto overscroll-contain p-4 sm:p-5">
+          <section className="rounded-[20px] bg-background/55 px-4 py-3.5">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-[11px] font-medium leading-none text-muted-foreground/75">
+                {messageLabel}
+              </div>
+              {localTrigger && triggerCommand ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 shrink-0 rounded-full px-2 text-[11.5px]"
+                  onClick={() => {
+                    void copyTextToClipboard(triggerCommand).then((ok) => {
+                      if (ok) setCommandCopied(true);
+                    });
+                  }}
+                >
+                  {commandCopied ? (
+                    <Check className="mr-1.5 h-3.5 w-3.5" aria-hidden />
+                  ) : (
+                    <Clipboard className="mr-1.5 h-3.5 w-3.5" aria-hidden />
+                  )}
+                  {commandCopied
+                    ? tx("settings.automations.commandCopied", "Copied")
+                    : tx("settings.automations.copyCommand", "Copy")}
+                </Button>
+              ) : null}
+            </div>
+            <div
+              className={cn(
+                "mt-3 whitespace-pre-wrap break-words text-[13px] leading-6 text-foreground/85",
+                localTrigger && "font-mono text-[12.5px]",
+                !messageExpanded && messageNeedsExpansion && "line-clamp-6",
+              )}
+            >
+              {message}
+            </div>
+            {messageNeedsExpansion ? (
+              <button
+                type="button"
+                className="mt-3 inline-flex text-[12px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                onClick={() => setMessageExpanded((value) => !value)}
+              >
+                {messageExpanded
+                  ? tx("settings.automations.message.showLess", "Show less")
+                  : tx("settings.automations.message.showMore", "Show full message")}
+              </button>
+            ) : null}
+          </section>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <AutomationDetail
+              label={tx("settings.automations.labels.next", "Next")}
+              title={formatAutomationNextTitle(job, locale, tx)}
+            >
+              {formatAutomationNext(job, tx)}
+            </AutomationDetail>
+            <AutomationDetail label={tx("settings.automations.labels.origin", "Linked chat")} title={origin}>
+              {originHref ? (
+                <a
+                  className="inline-flex max-w-full items-center gap-1 text-foreground/80 underline-offset-2 hover:underline"
+                  href={originHref}
+                >
+                  <span className="truncate">{origin}</span>
+                  <ExternalLink className="h-3 w-3 shrink-0" aria-hidden />
+                </a>
+              ) : (
+                origin
+              )}
+            </AutomationDetail>
+          </div>
+
+          {job.state.last_error ? (
+            <div className="rounded-[16px] border border-destructive/20 bg-destructive/8 px-3 py-2 text-[12px] leading-5 text-destructive">
+              {job.state.last_error}
+            </div>
+          ) : null}
+        </div>
+
+        <aside className="min-h-0 overflow-y-auto overscroll-contain border-t border-border/35 bg-settings-surface p-4 text-[12px] text-muted-foreground lg:border-l lg:border-t-0">
+          <div className="grid gap-3">
+            <AutomationDetail
+              label={tx("settings.automations.labels.schedule", "Schedule")}
+              title={schedule}
+            >
+              {schedule}
+            </AutomationDetail>
+            <div className="rounded-[18px] bg-background/55 p-3">
+              <div className="grid gap-3">
+                {created ? (
+                  <div>
+                    <div className="text-[11px] leading-none text-muted-foreground/75">
+                      {tx("settings.automations.labels.created", "Created")}
+                    </div>
+                    <div className="mt-1.5 text-[12.5px] leading-5 text-foreground/80">{created}</div>
+                  </div>
+                ) : null}
+                {updated ? (
+                  <div>
+                    <div className="text-[11px] leading-none text-muted-foreground/75">
+                      {tx("settings.automations.labels.updated", "Updated")}
+                    </div>
+                    <div className="mt-1.5 text-[12.5px] leading-5 text-foreground/80">{updated}</div>
+                  </div>
+                ) : null}
+                <div>
+                  <div className="text-[11px] leading-none text-muted-foreground/75">ID</div>
+                  <div className="mt-1.5 break-all font-mono text-[11.5px] leading-5 text-foreground/70">
+                    {job.id}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </article>
+  );
+}
+
+function AutomationActionGroup({
+  job,
+  actionKey,
+  onAction,
+  onRequestEdit,
+  onRequestDelete,
+}: {
+  job: SessionAutomationJob;
+  actionKey: string | null;
+  onAction: (action: AutomationAction, job: SessionAutomationJob) => void | Promise<void>;
+  onRequestEdit: (job: SessionAutomationJob) => void;
+  onRequestDelete: (job: SessionAutomationJob) => void;
+}) {
+  const { t } = useTranslation();
+  const tx = (key: string, fallback: string, values?: Record<string, unknown>) =>
+    t(key, { defaultValue: fallback, ...(values ?? {}) });
+  const canManage = !job.protected;
+  const hasLinkedChat = Boolean(job.origin);
+  const localTrigger = isLocalTriggerAutomation(job);
+  const canRun = canManage && hasLinkedChat && job.enabled && !job.state.pending && !localTrigger;
+  const toggleAction: AutomationAction = job.enabled ? "disable" : "enable";
+  const canToggle = canManage && (job.enabled || hasLinkedChat);
+  const toggleBusy = actionKey === `${toggleAction}:${job.id}`;
+
+  if (!canManage) {
+    return (
+      <span className="inline-flex h-9 items-center rounded-full bg-muted px-3 text-[12px] font-medium text-muted-foreground">
+        {tx("settings.automations.protected", "Protected")}
+      </span>
+    );
+  }
+
+  return (
+    <div className="flex shrink-0 items-center gap-1 rounded-full bg-background/65 p-1">
+      <AppsActionButton
+        ariaLabel={tx("settings.automations.edit", "Edit")}
+        disabled={Boolean(actionKey)}
+        onClick={() => onRequestEdit(job)}
+      >
+        <Pencil className="h-4 w-4" aria-hidden />
+      </AppsActionButton>
+      {!localTrigger ? (
+        <AppsActionButton
+          ariaLabel={tx("settings.automations.runNow", "Run now")}
+          busy={actionKey === `run:${job.id}`}
+          disabled={!canRun}
+          onClick={() => void onAction("run", job)}
+        >
+          <PlayCircle className="h-4 w-4" aria-hidden />
+        </AppsActionButton>
+      ) : null}
+      <AppsActionButton
+        ariaLabel={
+          job.enabled
+            ? tx("settings.automations.pause", "Pause")
+            : tx("settings.automations.resume", "Resume")
+        }
+        busy={toggleBusy}
+        disabled={!canToggle}
+        onClick={() => void onAction(toggleAction, job)}
+      >
+        {job.enabled ? (
+          <PauseCircle className="h-4 w-4" aria-hidden />
+        ) : (
+          <PlayCircle className="h-4 w-4" aria-hidden />
+        )}
+      </AppsActionButton>
+      <AppsActionButton
+        ariaLabel={tx("settings.automations.delete", "Delete")}
+        tone="danger"
+        disabled={Boolean(actionKey)}
+        onClick={() => onRequestDelete(job)}
+      >
+        <Trash2 className="h-4 w-4" aria-hidden />
+      </AppsActionButton>
+    </div>
+  );
+}
+
+function AutomationStatusBadge({
+  tone = "neutral",
+  children,
+}: {
+  tone?: "neutral" | "success" | "warning";
+  children: ReactNode;
+}) {
+  return (
+    <span
+      className={cn(
+        "inline-flex h-6 items-center rounded-full px-2.5 text-[11.5px] font-medium",
+        tone === "success" &&
+          "bg-orange-100/72 text-orange-800 dark:bg-orange-300/12 dark:text-orange-200",
+        tone === "warning" &&
+          "bg-amber-100/80 text-amber-800 dark:bg-amber-300/14 dark:text-amber-200",
+        tone === "neutral" &&
+          "bg-white/64 text-muted-foreground dark:bg-background/35 dark:text-muted-foreground",
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+function automationMessageNeedsExpansion(message: string): boolean {
+  return message.length > 360 || message.split(/\r?\n/).length > 6;
+}
+
+function AutomationDetail({
+  label,
+  title,
+  secondary,
+  children,
+}: {
+  label: string;
+  title?: string;
+  secondary?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div className="min-w-0 rounded-[17px] bg-background/55 px-3 py-3">
+      <div className="text-[11px] font-medium leading-none text-muted-foreground/75">
+        {label}
+      </div>
+      <div className="mt-1.5 min-w-0">
+        <div className="line-clamp-2 text-[13px] leading-5 text-foreground/85" title={title}>
+          {children}
+        </div>
+        {secondary ? (
+          <div className="mt-0.5 truncate text-[11.5px] leading-4 text-muted-foreground" title={title}>
+            {secondary}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+type AutomationEveryUnit = "second" | "minute" | "hour" | "day";
+
+type AutomationEditDraft = {
+  name: string;
+  message: string;
+  scheduleKind: "at" | "every" | "cron";
+  everyValue: string;
+  everyUnit: AutomationEveryUnit;
+  cronExpr: string;
+  tz: string;
+  atLocal: string;
+};
+type AutomationScheduleUpdate = NonNullable<AutomationUpdatePayload["schedule"]>;
+
+const AUTOMATION_EVERY_UNITS: Array<{ value: AutomationEveryUnit; ms: number }> = [
+  { value: "second", ms: 1000 },
+  { value: "minute", ms: 60_000 },
+  { value: "hour", ms: 3_600_000 },
+  { value: "day", ms: 86_400_000 },
+];
+
+function AutomationEditDialog({
+  job,
+  saving,
+  onOpenChange,
+  onSave,
+}: {
+  job: SessionAutomationJob | null;
+  saving: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSave: (job: SessionAutomationJob, values: AutomationUpdatePayload) => void | Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const tx = (key: string, fallback: string, values?: Record<string, unknown>) =>
+    t(key, { defaultValue: fallback, ...(values ?? {}) });
+  const [draft, setDraft] = useState<AutomationEditDraft>(() => automationDraftFromJob(null));
+  const localTrigger = isLocalTriggerAutomation(job);
+
+  useEffect(() => {
+    setDraft(automationDraftFromJob(job));
+  }, [job]);
+
+  const validation = automationEditDraftError(draft, job, tx);
+  const scheduleOptions = [
+    { value: "every", label: tx("settings.automations.scheduleTypes.every", "Interval") },
+    { value: "cron", label: tx("settings.automations.scheduleTypes.cron", "Cron") },
+    { value: "at", label: tx("settings.automations.scheduleTypes.at", "Once") },
+  ];
+  const unitLabels: Record<AutomationEveryUnit, string> = {
+    second: tx("settings.automations.everyUnits.second", "Seconds"),
+    minute: tx("settings.automations.everyUnits.minute", "Minutes"),
+    hour: tx("settings.automations.everyUnits.hour", "Hours"),
+    day: tx("settings.automations.everyUnits.day", "Days"),
+  };
+
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const payload = automationUpdatePayloadFromDraft(draft, job);
+    if (!job || typeof payload === "string") return;
+    void onSave(job, payload);
+  };
+
+  return (
+    <Dialog open={Boolean(job)} onOpenChange={onOpenChange}>
+      {job ? (
+        <DialogContent
+          aria-describedby={undefined}
+          className="w-[min(calc(100vw-2rem),34rem)] rounded-[26px]"
+        >
+          <form className="space-y-5" onSubmit={submit}>
+            <DialogHeader>
+              <DialogTitle>{tx("settings.automations.editTitle", "Edit automation")}</DialogTitle>
+            </DialogHeader>
+
+            <div className="space-y-4">
+              <label className="block space-y-1.5">
+                <span className="text-[12px] font-medium text-muted-foreground">
+                  {tx("settings.automations.fields.name", "Name")}
+                </span>
+                <Input
+                  value={draft.name}
+                  onChange={(event) => setDraft((prev) => ({ ...prev, name: event.target.value }))}
+                  className="h-10 rounded-[12px]"
+                />
+              </label>
+
+              {!localTrigger ? (
+                <label className="block space-y-1.5">
+                  <span className="text-[12px] font-medium text-muted-foreground">
+                    {tx("settings.automations.fields.message", "Message")}
+                  </span>
+                  <Textarea
+                    value={draft.message}
+                    onChange={(event) => setDraft((prev) => ({ ...prev, message: event.target.value }))}
+                    className="min-h-[160px] resize-none rounded-[12px] text-[13px] leading-5"
+                  />
+                </label>
+              ) : null}
+
+              {!localTrigger ? (
+                <div className="space-y-2">
+                  <span className="text-[12px] font-medium text-muted-foreground">
+                    {tx("settings.automations.fields.scheduleType", "Schedule type")}
+                  </span>
+                  <SegmentedControl
+                    value={draft.scheduleKind}
+                    options={scheduleOptions}
+                    onChange={(value) =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        scheduleKind: value as AutomationEditDraft["scheduleKind"],
+                      }))
+                    }
+                  />
+                </div>
+              ) : null}
+
+              {!localTrigger && draft.scheduleKind === "every" ? (
+                <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_10rem]">
+                  <label className="block space-y-1.5">
+                    <span className="text-[12px] font-medium text-muted-foreground">
+                      {tx("settings.automations.fields.every", "Every")}
+                    </span>
+                    <Input
+                      type="number"
+                      min={1}
+                      step={1}
+                      value={draft.everyValue}
+                      onChange={(event) =>
+                        setDraft((prev) => ({ ...prev, everyValue: event.target.value }))
+                      }
+                      className="h-10 rounded-[12px]"
+                    />
+                  </label>
+                  <label className="block space-y-1.5">
+                    <span className="text-[12px] font-medium text-muted-foreground">
+                      {tx("settings.automations.fields.unit", "Unit")}
+                    </span>
+                    <select
+                      value={draft.everyUnit}
+                      onChange={(event) =>
+                        setDraft((prev) => ({
+                          ...prev,
+                          everyUnit: event.target.value as AutomationEveryUnit,
+                        }))
+                      }
+                      className="h-10 w-full rounded-[12px] border border-input bg-background px-3 text-[13px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      {AUTOMATION_EVERY_UNITS.map((unit) => (
+                        <option key={unit.value} value={unit.value}>
+                          {unitLabels[unit.value]}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+              ) : null}
+
+              {!localTrigger && draft.scheduleKind === "cron" ? (
+                <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_12rem]">
+                  <label className="block space-y-1.5">
+                    <span className="text-[12px] font-medium text-muted-foreground">
+                      {tx("settings.automations.fields.cronExpression", "Cron expression")}
+                    </span>
+                    <Input
+                      value={draft.cronExpr}
+                      onChange={(event) => setDraft((prev) => ({ ...prev, cronExpr: event.target.value }))}
+                      placeholder="0 9 * * *"
+                      className="h-10 rounded-[12px] font-mono text-[13px]"
+                    />
+                  </label>
+                  <label className="block space-y-1.5">
+                    <span className="text-[12px] font-medium text-muted-foreground">
+                      {tx("settings.automations.fields.timezone", "Timezone")}
+                    </span>
+                    <Input
+                      value={draft.tz}
+                      onChange={(event) => setDraft((prev) => ({ ...prev, tz: event.target.value }))}
+                      placeholder="Asia/Shanghai"
+                      className="h-10 rounded-[12px] text-[13px]"
+                    />
+                  </label>
+                </div>
+              ) : null}
+
+              {!localTrigger && draft.scheduleKind === "at" ? (
+                <label className="block space-y-1.5">
+                  <span className="text-[12px] font-medium text-muted-foreground">
+                    {tx("settings.automations.fields.runAt", "Run at")}
+                  </span>
+                  <Input
+                    type="datetime-local"
+                    value={draft.atLocal}
+                    onChange={(event) => setDraft((prev) => ({ ...prev, atLocal: event.target.value }))}
+                    className="h-10 rounded-[12px]"
+                  />
+                </label>
+              ) : null}
+
+              {validation ? (
+                <div className="rounded-[12px] bg-destructive/8 px-3 py-2 text-[12px] text-destructive">
+                  {validation}
+                </div>
+              ) : null}
+            </div>
+
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => onOpenChange(false)}
+                disabled={saving}
+                className="rounded-full"
+              >
+                {tx("settings.automations.cancel", "Cancel")}
+              </Button>
+              <Button type="submit" disabled={Boolean(validation) || saving} className="rounded-full">
+                {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden /> : null}
+                {tx("settings.automations.save", "Save")}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      ) : null}
+    </Dialog>
+  );
+}
+
+function AutomationDeleteDialog({
+  job,
+  deleting,
+  onOpenChange,
+  onConfirm,
+}: {
+  job: SessionAutomationJob | null;
+  deleting: boolean;
+  onOpenChange: (open: boolean) => void;
+  onConfirm: (job: SessionAutomationJob) => void | Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const tx = (key: string, fallback: string, values?: Record<string, unknown>) =>
+    t(key, { defaultValue: fallback, ...(values ?? {}) });
+  return (
+    <Dialog open={Boolean(job)} onOpenChange={onOpenChange}>
+      <DialogContent className="w-[min(calc(100vw-2rem),26rem)] rounded-[26px]">
+        <DialogHeader>
+          <DialogTitle>{tx("settings.automations.deleteTitle", "Delete automation")}</DialogTitle>
+          <DialogDescription>
+            {tx(
+              "settings.automations.deleteDescription",
+              "This removes {{name}} from automations. Past chat messages stay in the session.",
+              { name: job?.name || job?.id || "" },
+            )}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={() => onOpenChange(false)}
+            disabled={deleting}
+            className="rounded-full"
+          >
+            {tx("settings.automations.cancel", "Cancel")}
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            onClick={() => job && void onConfirm(job)}
+            disabled={!job || deleting}
+            className="rounded-full"
+          >
+            {deleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden /> : null}
+            {tx("settings.automations.delete", "Delete")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function NanobotFeatureInstallDialog({
+  feature,
+  installing,
+  onOpenChange,
+  onConfirm,
+}: {
+  feature: NanobotFeatureInfo | null;
+  installing: boolean;
+  onOpenChange: (open: boolean) => void;
+  onConfirm: (feature: NanobotFeatureInfo) => void | Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const tx = (key: string, fallback: string, values?: Record<string, unknown>) =>
+    t(key, { defaultValue: fallback, ...(values ?? {}) });
+  const name = feature?.display_name || feature?.name || "";
+  return (
+    <Dialog open={Boolean(feature)} onOpenChange={onOpenChange}>
+      <DialogContent
+        showCloseButton={false}
+        className="w-[min(calc(100vw-2rem),24rem)] gap-0 rounded-[28px] border border-white/70 bg-card/95 p-5 text-center shadow-[0_24px_80px_rgba(15,23,42,0.20)] backdrop-blur-xl sm:rounded-[28px]"
+      >
+        <DialogHeader className="items-center space-y-0 text-center">
+          <DialogTitle className="text-center text-[20px] font-semibold leading-tight tracking-[-0.02em] text-foreground">
+            {tx("settings.nanobotFeatures.installConfirmTitle", "Install support for {{name}}?", { name })}
+          </DialogTitle>
+          <DialogDescription className="mt-3 max-w-[20rem] text-center text-[14px] leading-6 text-muted-foreground">
+            {tx(
+              "settings.nanobotFeatures.installConfirmDescription",
+              "nanobot will add what {{name}} needs, then turn it on. Continue?",
+              { name },
+            )}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter className="mt-7 !grid grid-cols-1 gap-3 space-x-0 sm:grid-cols-2 sm:space-x-0">
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={() => onOpenChange(false)}
+            disabled={installing}
+            className="h-11 w-full min-w-0 rounded-full bg-muted/70 px-5 text-[15px] font-semibold text-foreground shadow-none hover:bg-muted"
+          >
+            {tx("settings.automations.cancel", "Cancel")}
+          </Button>
+          <Button
+            type="button"
+            onClick={() => feature && void onConfirm(feature)}
+            disabled={!feature || installing}
+            className="h-11 w-full min-w-0 !whitespace-normal rounded-full px-5 text-center text-[15px] font-semibold"
+          >
+            {installing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden /> : null}
+            {tx("settings.nanobotFeatures.installConfirmAction", "Install and enable")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function isLocalTriggerAutomation(job: SessionAutomationJob | null): boolean {
+  if (!job) return false;
+  return job.kind === "local_trigger"
+    || job.payload.kind === "local_trigger"
+    || job.schedule.kind === "local";
+}
+
+function automationTriggerCommand(job: SessionAutomationJob): string {
+  return job.trigger?.command || job.payload.command || job.payload.message || "";
+}
+
+function automationSummary(
+  job: SessionAutomationJob,
+  tx: (key: string, fallback: string, values?: Record<string, unknown>) => string,
+): string {
+  if (isLocalTriggerAutomation(job)) {
+    return automationTriggerCommand(job) || tx("settings.automations.localTrigger", "Local trigger");
+  }
+  return job.payload.message || tx("settings.automations.systemTask", "System-managed automation");
+}
+
+function automationDetailText(
+  job: SessionAutomationJob,
+  tx: (key: string, fallback: string, values?: Record<string, unknown>) => string,
+): string {
+  return automationSummary(job, tx);
+}
+
+function automationNeedsAttention(job: SessionAutomationJob): boolean {
+  return job.state.last_status === "error";
+}
+
+function automationStatusKey(
+  job: SessionAutomationJob,
+): "active" | "running" | "paused" | "failed" | "system" | "completed" | "idle" {
+  if (job.protected) return "system";
+  if (job.state.pending) return "running";
+  if (!job.enabled) return "paused";
+  if (job.state.last_status === "error") return "failed";
+  if (isLocalTriggerAutomation(job)) return "active";
+  if (job.delete_after_run && !job.state.next_run_at_ms && job.state.last_status === "ok") {
+    return "completed";
+  }
+  if (!job.state.next_run_at_ms) return "idle";
+  return "active";
+}
+
+function sortAutomationJobs(jobs: SessionAutomationJob[], sort: AutomationSort): SessionAutomationJob[] {
+  const byName = (left: SessionAutomationJob, right: SessionAutomationJob) =>
+    (left.name || left.id).localeCompare(right.name || right.id);
+  return [...jobs].sort((left, right) => {
+    if (sort === "name") return byName(left, right);
+    if (sort === "last") {
+      return (right.state.last_run_at_ms ?? 0) - (left.state.last_run_at_ms ?? 0) || byName(left, right);
+    }
+    if (sort === "updated") {
+      return (right.updated_at_ms ?? 0) - (left.updated_at_ms ?? 0) || byName(left, right);
+    }
+    const leftNext = left.state.next_run_at_ms ?? Number.MAX_SAFE_INTEGER;
+    const rightNext = right.state.next_run_at_ms ?? Number.MAX_SAFE_INTEGER;
+    return leftNext - rightNext || byName(left, right);
+  });
+}
+
+function automationDraftFromJob(job: SessionAutomationJob | null): AutomationEditDraft {
+  const every = automationIntervalDraft(job?.schedule.every_ms ?? 3_600_000);
+  const scheduleKind = job?.schedule.kind === "at" || job?.schedule.kind === "cron"
+    ? job.schedule.kind
+    : "every";
+  return {
+    name: job?.name ?? "",
+    message: job?.payload.message ?? "",
+    scheduleKind,
+    everyValue: every.value,
+    everyUnit: every.unit,
+    cronExpr: job?.schedule.expr ?? "0 9 * * *",
+    tz: job?.schedule.tz ?? "",
+    atLocal: formatLocalDateTimeInput(job?.schedule.at_ms ?? Date.now() + 3_600_000),
+  };
+}
+
+function automationIntervalDraft(ms: number): { value: string; unit: AutomationEveryUnit } {
+  for (const unit of [...AUTOMATION_EVERY_UNITS].reverse()) {
+    if (ms >= unit.ms && ms % unit.ms === 0) {
+      return { value: String(ms / unit.ms), unit: unit.value };
+    }
+  }
+  return { value: String(Math.max(1, Math.round(ms / 60_000))), unit: "minute" };
+}
+
+function formatLocalDateTimeInput(ms: number): string {
+  const date = new Date(ms);
+  if (!Number.isFinite(date.getTime())) return "";
+  const local = new Date(ms - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function automationEditDraftError(
+  draft: AutomationEditDraft,
+  job: SessionAutomationJob | null,
+  tx: (key: string, fallback: string, values?: Record<string, unknown>) => string,
+): string | null {
+  if (!draft.name.trim()) return tx("settings.automations.validation.nameRequired", "Name is required.");
+  if (isLocalTriggerAutomation(job)) return null;
+  if (!draft.message.trim()) {
+    return tx("settings.automations.validation.messageRequired", "Message is required.");
+  }
+  if (draft.scheduleKind === "every") {
+    const value = Number(draft.everyValue);
+    if (!Number.isInteger(value) || value <= 0) {
+      return tx("settings.automations.validation.intervalRequired", "Interval must be a positive number.");
+    }
+  }
+  if (draft.scheduleKind === "cron" && !draft.cronExpr.trim()) {
+    return tx("settings.automations.validation.cronRequired", "Cron expression is required.");
+  }
+  if (draft.scheduleKind === "at") {
+    const atMs = new Date(draft.atLocal).getTime();
+    if (!Number.isFinite(atMs)) {
+      return tx("settings.automations.validation.timeRequired", "Run time is required.");
+    }
+    if (atMs <= Date.now() && automationScheduleChanged(draft, job)) {
+      return tx("settings.automations.validation.futureRequired", "Run time must be in the future.");
+    }
+  }
+  return null;
+}
+
+function automationUpdatePayloadFromDraft(
+  draft: AutomationEditDraft,
+  job: SessionAutomationJob | null,
+): AutomationUpdatePayload | string {
+  const name = draft.name.trim();
+  if (isLocalTriggerAutomation(job)) {
+    if (!name) return "invalid";
+    return { name };
+  }
+  const message = draft.message.trim();
+  if (!name || !message) return "invalid";
+  const payload: AutomationUpdatePayload = { name, message };
+  const schedule = automationSchedulePayloadFromDraft(draft);
+  if (typeof schedule === "string") return schedule;
+  if (automationScheduleChanged(draft, job, schedule)) {
+    payload.schedule = schedule;
+  }
+  return payload;
+}
+
+function automationSchedulePayloadFromDraft(draft: AutomationEditDraft): AutomationScheduleUpdate | string {
+  if (draft.scheduleKind === "every") {
+    const unit = AUTOMATION_EVERY_UNITS.find((candidate) => candidate.value === draft.everyUnit);
+    const value = Number(draft.everyValue);
+    if (!unit || !Number.isInteger(value) || value <= 0) return "invalid";
+    return { kind: "every", every_ms: value * unit.ms };
+  } else if (draft.scheduleKind === "cron") {
+    const expr = draft.cronExpr.trim();
+    if (!expr) return "invalid";
+    return { kind: "cron", expr, ...(draft.tz.trim() ? { tz: draft.tz.trim() } : {}) };
+  } else {
+    const atMs = new Date(draft.atLocal).getTime();
+    if (!Number.isFinite(atMs)) return "invalid";
+    return { kind: "at", at_ms: atMs };
+  }
+}
+
+function automationScheduleChanged(
+  draft: AutomationEditDraft,
+  job: SessionAutomationJob | null,
+  schedule: AutomationScheduleUpdate | string = automationSchedulePayloadFromDraft(draft),
+): boolean {
+  if (!job || typeof schedule === "string") return true;
+  if (schedule.kind !== job.schedule.kind) return true;
+  if (schedule.kind === "every") return schedule.every_ms !== job.schedule.every_ms;
+  if (schedule.kind === "cron") {
+    return schedule.expr !== (job.schedule.expr ?? "") || (schedule.tz ?? null) !== (job.schedule.tz ?? null);
+  }
+  return draft.atLocal !== formatLocalDateTimeInput(job.schedule.at_ms ?? NaN);
+}
+
+type AutomationSearchField = "id" | "name" | "message" | "chat" | "cron" | "schedule" | "status";
+
+interface AutomationSearchToken {
+  field: AutomationSearchField | null;
+  value: string;
+}
+
+const AUTOMATION_SEARCH_FIELDS = new Set<AutomationSearchField>([
+  "id",
+  "name",
+  "message",
+  "chat",
+  "cron",
+  "schedule",
+  "status",
+]);
+
+const HOST_AUTOMATION_CHANNEL_LABELS: Record<string, string> = {
+  api: "API",
+  cli: "CLI",
+};
+
+function parseAutomationSearchQuery(query: string): AutomationSearchToken[] {
+  return (query.match(/[^\s:]+:"[^"]+"|"[^"]+"|\S+/g) ?? [])
+    .map((rawPart): AutomationSearchToken | null => {
+      const part = trimAutomationSearchValue(rawPart);
+      if (!part) return null;
+      const fieldMatch = part.match(/^([A-Za-z]+):(.*)$/);
+      if (!fieldMatch) return { field: null, value: part.toLowerCase() };
+      const field = fieldMatch[1].toLowerCase() as AutomationSearchField;
+      const value = trimAutomationSearchValue(fieldMatch[2]).toLowerCase();
+      if (!value) return null;
+      return AUTOMATION_SEARCH_FIELDS.has(field)
+        ? { field, value }
+        : { field: null, value: part.toLowerCase() };
+    })
+    .filter((token): token is AutomationSearchToken => Boolean(token));
+}
+
+function trimAutomationSearchValue(value: string): string {
+  return value.trim().replace(/^"|"$/g, "").trim();
+}
+
+function automationMatchesSearch(job: SessionAutomationJob, tokens: AutomationSearchToken[]): boolean {
+  return tokens.every((token) => automationSearchText(job, token.field).includes(token.value));
+}
+
+function automationSearchText(job: SessionAutomationJob, field: AutomationSearchField | null = null): string {
+  return automationSearchParts(job, field)
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function automationSearchParts(
+  job: SessionAutomationJob,
+  field: AutomationSearchField | null,
+): Array<string | number | null | undefined> {
+  const originParts = automationOriginSearchParts(job);
+  const scheduleParts = automationScheduleSearchParts(job);
+  if (field === "id") return [job.id];
+  if (field === "name") return [job.name, job.id];
+  if (field === "message") return [job.payload.message, job.payload.command, job.trigger?.command];
+  if (field === "chat") return originParts;
+  if (field === "cron" || field === "schedule") return scheduleParts;
+  if (field === "status") return [automationStatusKey(job), job.enabled ? "enabled" : "disabled"];
+  return [
+    job.id,
+    job.name,
+    job.payload.message,
+    job.payload.command,
+    job.trigger?.command,
+    isLocalTriggerAutomation(job) ? "trigger local" : null,
+    ...scheduleParts,
+    automationStatusKey(job),
+    ...originParts,
+  ];
+}
+
+function automationOriginSearchParts(job: SessionAutomationJob): Array<string | null | undefined> {
+  const origin = job.origin;
+  if (!origin) return [];
+  const channel = origin.channel.trim().toLowerCase();
+  return [
+    origin.session_key,
+    origin.title,
+    origin.preview,
+    origin.channel,
+    automationChannelDisplayName(channel),
+  ];
+}
+
+function automationScheduleSearchParts(job: SessionAutomationJob): Array<string | number | null | undefined> {
+  const schedule = job.schedule;
+  const parts: Array<string | number | null | undefined> = [
+    schedule.kind,
+    schedule.expr,
+    schedule.tz,
+    schedule.every_ms,
+    schedule.at_ms,
+  ];
+  if (schedule.kind === "cron" && schedule.expr) {
+    parts.push(...automationCronSearchParts(schedule.expr));
+  }
+  return parts;
+}
+
+function automationCronSearchParts(expr: string): string[] {
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) return [];
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = parts;
+  const everyDay = dayOfMonth === "*" && month === "*" && dayOfWeek === "*";
+  const numericMinute = cronNumericToken(minute, 59);
+  const numericHour = cronNumericToken(hour, 23);
+  if (numericMinute === null) return [];
+  const paddedMinute = String(numericMinute).padStart(2, "0");
+
+  if (numericHour !== null) {
+    const time = `${String(numericHour).padStart(2, "0")}:${paddedMinute}`;
+    return [time, `:${paddedMinute}`];
+  }
+
+  if (everyDay && hour === "*") {
+    return [`:${paddedMinute}`, `hourly at :${paddedMinute}`];
+  }
+
+  const range = /^(\d{1,2})-(\d{1,2})$/.exec(hour);
+  if (!everyDay || !range) return [];
+  const start = Number(range[1]);
+  const end = Number(range[2]);
+  if (start > 23 || end > 23) return [];
+  const paddedRange = `${String(start).padStart(2, "0")}-${String(end).padStart(2, "0")}`;
+  const rawRange = `${start}-${end}`;
+  return [
+    paddedRange,
+    rawRange,
+    `:${paddedMinute}`,
+    `${paddedRange} at :${paddedMinute}`,
+    `hourly ${paddedRange} at :${paddedMinute}`,
+  ];
+}
+
+function automationMatchesFilter(job: SessionAutomationJob, filter: AutomationFilter): boolean {
+  const status = automationStatusKey(job);
+  if (filter === "active") return status === "active" || status === "running";
+  if (filter === "paused") return status === "paused";
+  if (filter === "failed") return automationNeedsAttention(job);
+  if (filter === "system") return Boolean(job.protected);
+  return true;
+}
+
+const AUTOMATION_FILTER_TONES: Partial<
+  Record<AutomationFilter, { text: string; selectedText: string; count: string }>
+> = {
+  active: {
+    text: "text-emerald-600 dark:text-emerald-400",
+    selectedText: "text-emerald-700 dark:text-emerald-300",
+    count: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  },
+  paused: {
+    text: "text-amber-600 dark:text-amber-400",
+    selectedText: "text-amber-700 dark:text-amber-300",
+    count: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  },
+  failed: {
+    text: "text-rose-600 dark:text-rose-400",
+    selectedText: "text-rose-700 dark:text-rose-300",
+    count: "bg-rose-500/10 text-rose-700 dark:text-rose-300",
+  },
+  system: {
+    text: "text-sky-600 dark:text-sky-400",
+    selectedText: "text-sky-700 dark:text-sky-300",
+    count: "bg-sky-500/10 text-sky-700 dark:text-sky-300",
+  },
+};
+
+function automationFilterToneClass(value: AutomationFilter, count: number, selected: boolean): string {
+  const tone = AUTOMATION_FILTER_TONES[value];
+  if (count <= 0 || !tone) return "";
+  return selected ? tone.selectedText : tone.text;
+}
+
+function automationFilterCountClass(value: AutomationFilter, count: number): string {
+  const tone = AUTOMATION_FILTER_TONES[value];
+  return count > 0 && tone ? tone.count : "";
+}
+
+function automationStatus(
+  job: SessionAutomationJob,
+  tx: (key: string, fallback: string, values?: Record<string, unknown>) => string,
+): { label: string; tone: "neutral" | "success" | "warning" } {
+  const status = automationStatusKey(job);
+  if (status === "system") return { label: tx("settings.automations.status.system", "System"), tone: "neutral" };
+  if (status === "running") {
+    return { label: tx("settings.automations.status.running", "Running now"), tone: "warning" };
+  }
+  if (status === "paused") return { label: tx("settings.automations.status.paused", "Paused"), tone: "neutral" };
+  if (status === "failed") {
+    return { label: tx("settings.automations.status.failed", "Failed"), tone: "warning" };
+  }
+  if (status === "completed") {
+    return { label: tx("settings.automations.status.completed", "Completed"), tone: "neutral" };
+  }
+  if (status === "idle") {
+    return { label: tx("settings.automations.status.noSchedule", "No schedule"), tone: "neutral" };
+  }
+  return { label: tx("settings.automations.status.active", "Active"), tone: "success" };
+}
+
+function automationOriginLabel(
+  job: SessionAutomationJob,
+  tx: (key: string, fallback: string, values?: Record<string, unknown>) => string,
+): string {
+  if (job.protected) return tx("settings.automations.origin.system", "System");
+  const origin = job.origin;
+  if (!origin) return tx("settings.automations.origin.unknown", "No linked chat");
+  if (origin.channel !== "websocket") return automationChannelLabel(origin.channel, tx);
+  return origin.title || origin.preview || origin.session_key || automationChannelLabel(origin.channel, tx);
+}
+
+function automationChannelLabel(
+  channel: string,
+  tx: (key: string, fallback: string, values?: Record<string, unknown>) => string,
+): string {
+  const key = channel.trim().toLowerCase();
+  const displayName = automationChannelDisplayName(key);
+  return displayName
+    ? tx(`settings.automations.channels.${key}`, displayName)
+    : channel;
+}
+
+function automationChannelDisplayName(channel: string): string | undefined {
+  const key = channel.trim().toLowerCase();
+  return channelUiPresentation(key)?.displayName ?? HOST_AUTOMATION_CHANNEL_LABELS[key];
+}
+
+function formatAutomationSchedule(
+  job: SessionAutomationJob,
+  locale: string,
+  tx: (key: string, fallback: string, values?: Record<string, unknown>) => string,
+): string {
+  if (job.schedule.kind === "at" && job.schedule.at_ms) {
+    return tx("settings.automations.schedule.at", "At {{time}}", {
+      time: fmtDateTime(job.schedule.at_ms, locale),
+    });
+  }
+  if (job.schedule.kind === "every" && job.schedule.every_ms) {
+    return tx("settings.automations.schedule.every", "Every {{duration}}", {
+      duration: formatAutomationInterval(job.schedule.every_ms, locale),
+    });
+  }
+  if (job.schedule.kind === "cron" && job.schedule.expr) {
+    const summary = formatCronScheduleSummary(job.schedule.expr, tx);
+    if (summary) {
+      return job.schedule.tz
+        ? tx("settings.automations.schedule.withTz", "{{summary}} · {{tz}}", {
+            summary,
+            tz: job.schedule.tz,
+          })
+        : summary;
+    }
+    return job.schedule.tz
+      ? tx("settings.automations.schedule.cronWithTz", "Cron {{expr}} · {{tz}}", {
+          expr: job.schedule.expr,
+          tz: job.schedule.tz,
+        })
+      : tx("settings.automations.schedule.cron", "Cron {{expr}}", { expr: job.schedule.expr });
+  }
+  if (isLocalTriggerAutomation(job)) {
+    return tx("settings.automations.schedule.local", "Local trigger");
+  }
+  return tx("settings.automations.schedule.custom", "Custom schedule");
+}
+
+function formatCronScheduleSummary(
+  expr: string,
+  tx: (key: string, fallback: string, values?: Record<string, unknown>) => string,
+): string | null {
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) return null;
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = parts;
+  const numericMinute = cronNumericToken(minute, 59);
+  const numericHour = cronNumericToken(hour, 23);
+  const everyDay = dayOfMonth === "*" && month === "*" && dayOfWeek === "*";
+  const workdays = dayOfMonth === "*" && month === "*" && ["1-5", "MON-FRI", "mon-fri"].includes(dayOfWeek);
+
+  if (numericMinute !== null && numericHour !== null) {
+    const time = `${String(numericHour).padStart(2, "0")}:${String(numericMinute).padStart(2, "0")}`;
+    if (everyDay) return tx("settings.automations.schedule.dailyAt", "Daily at {{time}}", { time });
+    if (workdays) return tx("settings.automations.schedule.weekdaysAt", "Weekdays at {{time}}", { time });
+  }
+
+  if (everyDay && numericMinute !== null && hour === "*") {
+    return tx("settings.automations.schedule.hourlyAt", "Hourly at :{{minute}}", {
+      minute: String(numericMinute).padStart(2, "0"),
+    });
+  }
+
+  const range = /^(\d{1,2})-(\d{1,2})$/.exec(hour);
+  if (everyDay && numericMinute !== null && range) {
+    const start = Number(range[1]);
+    const end = Number(range[2]);
+    if (start > 23 || end > 23) return null;
+    return tx("settings.automations.schedule.hourlyWindow", "Hourly {{start}}-{{end}} at :{{minute}}", {
+      start: String(start).padStart(2, "0"),
+      end: String(end).padStart(2, "0"),
+      minute: String(numericMinute).padStart(2, "0"),
+    });
+  }
+
+  return null;
+}
+
+function cronNumericToken(value: string, max: number): number | null {
+  if (!/^\d{1,2}$/.test(value)) return null;
+  const parsed = Number(value);
+  return parsed <= max ? parsed : null;
+}
+
+function formatAutomationNext(
+  job: SessionAutomationJob,
+  tx: (key: string, fallback: string, values?: Record<string, unknown>) => string,
+): string {
+  if (!job.enabled) return tx("settings.automations.next.paused", "Paused");
+  if (job.state.pending) return tx("settings.automations.next.pending", "Running now");
+  if (isLocalTriggerAutomation(job)) {
+    return tx("settings.automations.next.local", "Waiting for trigger");
+  }
+  if (!job.state.next_run_at_ms) return tx("settings.automations.next.none", "No next run");
+  return relativeTime(job.state.next_run_at_ms);
+}
+
+function formatAutomationNextTitle(
+  job: SessionAutomationJob,
+  locale: string,
+  tx: (key: string, fallback: string, values?: Record<string, unknown>) => string,
+): string {
+  if (!job.state.next_run_at_ms) return formatAutomationNext(job, tx);
+  return fmtDateTime(job.state.next_run_at_ms, locale);
+}
+
+function automationStatusDotClass(job: SessionAutomationJob): string {
+  const status = automationStatusKey(job);
+  if (status === "active" || status === "running") return "bg-orange-500";
+  if (status === "failed") return "bg-amber-500";
+  return "bg-muted-foreground/45";
+}
+
+function formatAutomationUnit(
+  value: number,
+  unit: Intl.NumberFormatOptions["unit"],
+  locale: string,
+  maximumFractionDigits = 0,
+): string {
+  return new Intl.NumberFormat(locale, {
+    style: "unit",
+    unit,
+    unitDisplay: "long",
+    maximumFractionDigits,
+  }).format(value);
+}
+
+function formatAutomationInterval(ms: number, locale: string): string {
+  const units: Array<[Intl.NumberFormatOptions["unit"], number]> = [
+    ["day", 86_400_000],
+    ["hour", 3_600_000],
+    ["minute", 60_000],
+    ["second", 1000],
+  ];
+  for (const [unit, size] of units) {
+    if (ms >= size && ms % size === 0) return formatAutomationUnit(ms / size, unit, locale);
+  }
+  const fallbackUnit = ms < 60_000 ? "second" : "minute";
+  const fallbackSize = fallbackUnit === "second" ? 1000 : 60_000;
+  return formatAutomationUnit(ms / fallbackSize, fallbackUnit, locale, 1);
+}
+
+function DismissibleStatusMessage({
+  message,
+  isError,
+  onDismiss,
+}: {
+  message: string;
+  isError: boolean;
+  onDismiss: () => void;
+}) {
+  const { t } = useTranslation();
+  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
+  return (
+    <div
+      className={cn(
+        "flex items-center justify-between gap-3 rounded-[12px] border py-2.5 pl-4 pr-2 text-[13px]",
+        isError
+          ? "border-destructive/20 bg-destructive/5 text-destructive"
+          : "border-border/55 bg-muted/35 text-muted-foreground",
+      )}
+    >
+      <span className="min-w-0">{message}</span>
+      <button
+        type="button"
+        aria-label={tx("settings.actions.dismiss", "Dismiss")}
+        title={tx("settings.actions.dismiss", "Dismiss")}
+        onClick={onDismiss}
+        className={cn(
+          "flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors",
+          isError
+            ? "text-destructive/70 hover:bg-destructive/10 hover:text-destructive"
+            : "text-muted-foreground/70 hover:bg-muted hover:text-foreground",
+        )}
+      >
+        <X className="h-3.5 w-3.5" aria-hidden />
+      </button>
+    </div>
+  );
+}
+
+function RestartRequiredNotice({
+  message,
+  onRestart,
+  isRestarting,
+}: {
+  message: string;
+  onRestart?: () => void;
+  isRestarting?: boolean;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex flex-col gap-3 rounded-[12px] border border-amber-500/20 bg-amber-500/8 px-4 py-3 text-[12.5px] text-amber-800 dark:text-amber-200 sm:flex-row sm:items-center sm:justify-between">
+      <span>{message}</span>
+      {onRestart ? (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={onRestart}
+          disabled={isRestarting}
+          className="h-8 rounded-full bg-background/80 px-3 text-[12px] font-semibold"
+        >
+          {isRestarting ? (
+            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+          ) : (
+            <RotateCcw className="mr-1.5 h-3.5 w-3.5" aria-hidden />
+          )}
+          {isRestarting ? t("app.system.restarting") : t("app.system.restart")}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+function ChannelsSettings({
+  token,
+  nanobotFeatures,
+  loading,
+  query,
+  actionKey,
+  chatAppsDocsUrl,
+  showBrandLogos,
+  error,
+  requiresRestartPending,
+  onQueryChange,
+  onAction,
+  onFeaturesUpdate,
+  onDismissStatus,
+  onRestart,
+  isRestarting,
+}: {
+  token: string;
+  nanobotFeatures: NanobotFeaturesPayload | null;
+  loading: boolean;
+  query: string;
+  actionKey: string | null;
+  chatAppsDocsUrl?: string;
+  showBrandLogos: boolean;
+  error: string | null;
+  requiresRestartPending: boolean;
+  onQueryChange: (value: string) => void;
+  onAction: (action: "enable" | "disable", name: string) => void;
+  onFeaturesUpdate: (payload: NanobotFeaturesPayload) => void;
+  onDismissStatus: () => void;
+  onRestart?: () => void;
+  isRestarting?: boolean;
+}) {
+  const { t } = useTranslation();
+  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
+  const normalizedQuery = query.trim().toLowerCase();
+  const [filter, setFilter] = useState<ChannelFilter>("all");
+  const splitLayout = useMediaQuery("(min-width: 1280px)");
+  const containerRef = useRef<HTMLDivElement>(null);
+  const compactDetailTopRef = useRef<HTMLButtonElement>(null);
+  const [compactDetailOpen, setCompactDetailOpen] = useState(false);
+  const allChannels = (nanobotFeatures?.features ?? [])
+    .filter((feature) => feature.type === "channel")
+    .filter((feature) => feature.settings_visible !== false)
+    .filter((feature) => !normalizedQuery || channelSearchText(feature, t).includes(normalizedQuery))
+    .sort((left, right) => {
+      const rank = Number(!left.ready) - Number(!right.ready);
+      return rank || localizedChannelDisplayName(left, t).localeCompare(
+        localizedChannelDisplayName(right, t),
+      );
+    });
+  const channels = allChannels.filter((feature) => channelMatchesFilter(feature, filter));
+  const [selectedChannelName, setSelectedChannelName] = useState<string | null>(null);
+  const selectedChannel =
+    channels.find((feature) => feature.name === selectedChannelName) ?? channels[0] ?? null;
+  const enabledCount = allChannels.filter(channelIsRunning).length;
+  const offCount = Math.max(0, allChannels.length - enabledCount);
+  const filterOptions: Array<{ value: ChannelFilter; label: string; count: number }> = [
+    { value: "all", label: tx("settings.channels.filterAll", "All"), count: allChannels.length },
+    { value: "on", label: tx("settings.channels.filterOn", "On"), count: enabledCount },
+    { value: "off", label: tx("settings.channels.filterOff", "Off"), count: offCount },
+  ];
+  const statusMessage = error;
+  const statusIsError = true;
+
+  useEffect(() => {
+    if (!channels.length) {
+      if (selectedChannelName !== null) setSelectedChannelName(null);
+      setCompactDetailOpen(false);
+      return;
+    }
+    if (!selectedChannelName || !channels.some((feature) => feature.name === selectedChannelName)) {
+      setSelectedChannelName(channels[0].name);
+      setCompactDetailOpen(false);
+    }
+  }, [channels, selectedChannelName]);
+
+  useEffect(() => {
+    if (splitLayout) return;
+    const resetScroll = () => {
+      let node = containerRef.current?.parentElement ?? null;
+      while (node) {
+        node.scrollTop = 0;
+        node = node.parentElement;
+      }
+      if (compactDetailOpen) {
+        compactDetailTopRef.current?.scrollIntoView?.({ block: "start" });
+      }
+    };
+    resetScroll();
+    const frame = window.requestAnimationFrame(resetScroll);
+    return () => window.cancelAnimationFrame(frame);
+  }, [compactDetailOpen, selectedChannelName, splitLayout]);
+
+  const openChannel = (name: string) => {
+    setSelectedChannelName(name);
+    if (!splitLayout) setCompactDetailOpen(true);
+  };
+
+  const setupPanel = selectedChannel ? (
+    <ChannelSetupPanel
+      token={token}
+      feature={selectedChannel}
+      actionKey={actionKey}
+      chatAppsDocsUrl={chatAppsDocsUrl}
+      showBrandLogos={showBrandLogos}
+      onAction={onAction}
+      onFeaturesUpdate={onFeaturesUpdate}
+    />
+  ) : null;
+  const showingCompactDetail = !splitLayout && compactDetailOpen && selectedChannel !== null;
+
+  return (
+    <div
+      ref={containerRef}
+      className="flex min-h-full flex-1 flex-col xl:min-h-0 xl:overflow-hidden"
+    >
+      {!showingCompactDetail ? (
+        <section className="shrink-0 space-y-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+            <p className="max-w-[680px] text-[13px] leading-5 text-muted-foreground">
+              {tx(
+                "settings.channels.description",
+                "Connect chat apps, email, and WebUI to nanobot.",
+              )}
+            </p>
+            <div className="flex flex-wrap gap-2 text-[12px] font-medium text-muted-foreground">
+              <span className="rounded-full bg-muted/70 px-2.5 py-1">
+                {t("settings.channels.caption", {
+                  enabled: enabledCount,
+                  total: allChannels.length,
+                  defaultValue: "{{enabled}} enabled · {{total}} channels",
+                })}
+              </span>
+            </div>
+          </div>
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+            <div className="relative min-w-0 flex-1">
+              <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+              <Input
+                value={query}
+                onChange={(event) => onQueryChange(event.target.value)}
+                placeholder={tx("settings.channels.searchPlaceholder", "Search channels")}
+                className={cn(
+                  "h-12 rounded-[14px] pl-11 text-[15px]",
+                  SETTINGS_SEARCH_INPUT_CLASS,
+                )}
+              />
+            </div>
+            <div className="flex shrink-0 flex-wrap gap-1.5 rounded-[14px] bg-muted/55 p-1">
+              {filterOptions.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setFilter(option.value)}
+                  className={cn(
+                    "rounded-[11px] px-3 py-1.5 text-[12px] font-medium transition-colors",
+                    filter === option.value
+                      ? "bg-background text-foreground"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {option.label}
+                  <span className="ml-1 text-[11px] text-muted-foreground">{option.count}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {statusMessage ? (
+        <div className="mt-3 shrink-0">
+          <DismissibleStatusMessage
+            message={statusMessage}
+            isError={statusIsError}
+            onDismiss={onDismissStatus}
+          />
+        </div>
+      ) : null}
+
+      {requiresRestartPending ? (
+        <div className="mt-3 shrink-0">
+          <RestartRequiredNotice
+            message={tx("settings.channels.restartRequired", "Restart nanobot to apply updated channel support.")}
+            onRestart={onRestart}
+            isRestarting={isRestarting}
+          />
+        </div>
+      ) : null}
+
+      <section
+        className={cn(
+          "flex flex-1 flex-col",
+          showingCompactDetail ? "mt-1" : "mt-5",
+          splitLayout && "min-h-0 overflow-hidden",
+        )}
+      >
+        {loading && !nanobotFeatures ? (
+          <div className="flex h-36 items-center justify-center text-sm text-muted-foreground">
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden />
+            {tx("settings.channels.loading", "Loading Channels...")}
+          </div>
+        ) : channels.length ? splitLayout ? (
+          <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_minmax(400px,460px)] gap-6 overflow-hidden">
+            <div className="min-h-0 space-y-1 overflow-y-auto overscroll-contain pr-1">
+              {channels.map((feature) => (
+                <ChannelCatalogRow
+                  key={feature.name}
+                  feature={feature}
+                  selected={selectedChannel?.name === feature.name}
+                  showBrandLogos={showBrandLogos}
+                  onSelect={() => openChannel(feature.name)}
+                />
+              ))}
+            </div>
+            <div className="min-h-0 overflow-y-auto overscroll-contain pr-1">{setupPanel}</div>
+          </div>
+        ) : showingCompactDetail ? (
+          <div className="pb-6">
+            <button
+              ref={compactDetailTopRef}
+              type="button"
+              onClick={() => setCompactDetailOpen(false)}
+              className="mb-4 inline-flex h-9 items-center gap-1.5 rounded-full px-2.5 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
+            >
+              <ChevronLeft className="h-4 w-4" aria-hidden />
+              {tx("settings.channels.backToChannels", "All channels")}
+            </button>
+            {setupPanel}
+          </div>
+        ) : (
+          <div className="space-y-1 pb-6">
+            {channels.map((feature) => (
+              <ChannelCatalogRow
+                key={feature.name}
+                feature={feature}
+                selected={false}
+                showBrandLogos={showBrandLogos}
+                onSelect={() => openChannel(feature.name)}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="min-h-0 flex-1 px-3 py-12 text-center text-sm text-muted-foreground">
+            {tx("settings.channels.empty", "No channels match this filter.")}
+          </div>
+        )}
+      </section>
+
+      <div className={cn("shrink-0 pt-2", showingCompactDetail && "hidden")}>
+        <ThirdPartyBrandNotice />
+      </div>
+    </div>
+  );
+}
+
 function AppsCatalogSettings({
   cliApps,
   mcpPresets,
@@ -3317,9 +7165,9 @@ function AppsCatalogSettings({
   const { t } = useTranslation();
   const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
   const filterOptions = [
-    { value: "all", label: tx("settings.apps.filterAll", "All") },
-    { value: "cli", label: tx("settings.apps.filterCli", "App CLIs") },
-    { value: "mcp", label: tx("settings.apps.filterMcp", "MCP services") },
+    { value: "ready", label: tx("settings.apps.filterAll", "Ready") },
+    { value: "cli", label: tx("settings.apps.filterCli", "Apps") },
+    { value: "mcp", label: tx("settings.apps.filterMcp", "Integrations") },
   ];
   const normalizedQuery = query.trim().toLowerCase();
   const items: AppsCatalogItem[] = [
@@ -3330,8 +7178,10 @@ function AppsCatalogSettings({
       preset,
     })),
   ]
-    .filter((item) => filter === "all" || item.kind === filter)
-    .filter((item) => !normalizedQuery || appsSearchText(item).includes(normalizedQuery))
+    .filter((item) => {
+      if (normalizedQuery) return appsSearchText(item).includes(normalizedQuery);
+      return filter === "ready" ? appsReady(item) : item.kind === filter;
+    })
     .sort((left, right) => {
       const rank = Number(!appsReady(left)) - Number(!appsReady(right));
       return rank || appsTitle(left).localeCompare(appsTitle(right));
@@ -3339,13 +7189,19 @@ function AppsCatalogSettings({
   const focusedApp = cliFocusName
     ? (cliApps?.apps ?? []).find((app) => app.name === cliFocusName && app.installed)
     : null;
-  const loading = (cliAppsLoading || mcpPresetsLoading) && !cliApps && !mcpPresets;
-  const statusMessage = cliError || mcpError || (!focusedApp ? cliMessage || mcpMessage : null);
+  const loading =
+    (cliAppsLoading || mcpPresetsLoading) &&
+    !cliApps &&
+    !mcpPresets;
+  const statusMessage =
+    cliError ||
+    mcpError ||
+    (!focusedApp ? cliMessage || mcpMessage : null);
   const statusIsError = Boolean(cliError || mcpError);
-  const caption = t("settings.apps.caption", {
-    cli: cliApps?.installed_count ?? 0,
-    mcp: mcpPresets?.installed_count ?? 0,
-    defaultValue: "{{cli}} CLI · {{mcp}} MCP",
+  const readyCount = (cliApps?.installed_count ?? 0) + (mcpPresets?.installed_count ?? 0);
+  const caption = t("settings.apps.enabledSummary", {
+    count: readyCount,
+    defaultValue: "{{count}} ready",
   });
 
   return (
@@ -3355,7 +7211,7 @@ function AppsCatalogSettings({
           <p className="max-w-[680px] text-[13px] leading-5 text-muted-foreground">
             {tx(
               "settings.apps.description",
-              "Add local app adapters and connected tool servers that nanobot can use from chat.",
+              "Add tools to nanobot, then @ them in chat.",
             )}
           </p>
           <span className="text-[12px] font-medium text-muted-foreground">{caption}</span>
@@ -3367,7 +7223,10 @@ function AppsCatalogSettings({
               value={query}
               onChange={(event) => onQueryChange(event.target.value)}
               placeholder={tx("settings.apps.searchPlaceholder", "Search Apps")}
-              className="h-12 rounded-[14px] border-border/70 bg-card/90 pl-11 text-[15px] shadow-sm"
+              className={cn(
+                "h-12 rounded-[14px] pl-11 text-[15px]",
+                SETTINGS_SEARCH_INPUT_CLASS,
+              )}
             />
           </div>
           <SegmentedControl
@@ -3379,30 +7238,11 @@ function AppsCatalogSettings({
       </section>
 
       {statusMessage ? (
-        <div
-          className={cn(
-            "flex items-center justify-between gap-3 rounded-[12px] border py-2.5 pl-4 pr-2 text-[13px]",
-            statusIsError
-              ? "border-destructive/20 bg-destructive/5 text-destructive"
-              : "border-border/55 bg-muted/35 text-muted-foreground",
-          )}
-        >
-          <span className="min-w-0">{statusMessage}</span>
-          <button
-            type="button"
-            aria-label={tx("settings.actions.dismiss", "Dismiss")}
-            title={tx("settings.actions.dismiss", "Dismiss")}
-            onClick={onDismissStatus}
-            className={cn(
-              "flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors",
-              statusIsError
-                ? "text-destructive/70 hover:bg-destructive/10 hover:text-destructive"
-                : "text-muted-foreground/70 hover:bg-muted hover:text-foreground",
-            )}
-          >
-            <X className="h-3.5 w-3.5" aria-hidden />
-          </button>
-        </div>
+        <DismissibleStatusMessage
+          message={statusMessage}
+          isError={statusIsError}
+          onDismiss={onDismissStatus}
+        />
       ) : null}
 
       {focusedApp ? (
@@ -3410,31 +7250,16 @@ function AppsCatalogSettings({
       ) : null}
 
       {requiresRestartPending ? (
-        <div className="flex flex-col gap-3 rounded-[12px] border border-amber-500/20 bg-amber-500/8 px-4 py-3 text-[12.5px] text-amber-800 dark:text-amber-200 sm:flex-row sm:items-center sm:justify-between">
-          <span>{tx("settings.mcp.restartRequired", "Restart nanobot to connect updated MCP tools.")}</span>
-          {onRestart ? (
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              onClick={onRestart}
-              disabled={isRestarting}
-              className="h-8 rounded-full bg-background/80 px-3 text-[12px] font-semibold"
-            >
-              {isRestarting ? (
-                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
-              ) : (
-                <RotateCcw className="mr-1.5 h-3.5 w-3.5" aria-hidden />
-              )}
-              {isRestarting ? t("app.system.restarting") : t("app.system.restart")}
-            </Button>
-          ) : null}
-        </div>
+        <RestartRequiredNotice
+          message={tx("settings.apps.restartRequired", "Restart nanobot to apply updated apps and features.")}
+          onRestart={onRestart}
+          isRestarting={isRestarting}
+        />
       ) : null}
 
-      <section>
+      <section className="rounded-[22px] bg-settings-surface px-3 py-3 sm:px-4">
         <div className="flex items-center justify-between border-b border-border/45 pb-3">
-          <SettingsSectionTitle>{tx("settings.apps.featured", "Featured")}</SettingsSectionTitle>
+          <SettingsSectionTitle>{tx("settings.apps.featured", "Tools")}</SettingsSectionTitle>
           <span className="rounded-full bg-muted px-2.5 py-1 text-[12px] font-medium text-muted-foreground">
             {items.length}
           </span>
@@ -3471,12 +7296,12 @@ function AppsCatalogSettings({
           </div>
         ) : (
           <div className="px-3 py-12 text-center text-sm text-muted-foreground">
-            {tx("settings.apps.empty", "No apps match this filter.")}
+            {tx("settings.apps.empty", "No tools match this view.")}
           </div>
         )}
       </section>
 
-      {filter !== "cli" ? (
+      {filter === "mcp" ? (
         <McpCustomServerPanel
           form={customMcpForm}
           configImport={mcpConfigImport}
@@ -3514,12 +7339,12 @@ function CliAppsCatalogRow({
   const description = app.description || app.requires || app.entry_point || app.name;
 
   return (
-    <article className="group flex min-w-0 items-center gap-3 rounded-[14px] px-3 py-3 transition-colors hover:bg-muted/45">
+    <article className="apps-catalog-row group flex min-w-0 items-center gap-3 rounded-[14px] px-3 py-3 transition-colors hover:bg-muted/45">
       <CliAppLogo app={app} showBrandLogos={showBrandLogos} />
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-baseline gap-2">
           <h3 className="truncate text-[14px] font-semibold leading-5 text-foreground">{app.display_name}</h3>
-          <AppsTypeBadge>{tx("settings.apps.cliLabel", "CLI")}</AppsTypeBadge>
+          <AppsTypeBadge>{tx("settings.apps.cliLabel", "App")}</AppsTypeBadge>
         </div>
         <p className="mt-0.5 truncate text-[12.5px] leading-5 text-muted-foreground">{description}</p>
       </div>
@@ -3651,7 +7476,7 @@ function McpAppsCatalogRow({
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 items-baseline gap-2">
             <h3 className="truncate text-[14px] font-semibold leading-5 text-foreground">{preset.display_name}</h3>
-            <AppsTypeBadge>{tx("settings.apps.mcpLabel", "MCP")}</AppsTypeBadge>
+            <AppsTypeBadge>{tx("settings.apps.mcpLabel", "Integration")}</AppsTypeBadge>
           </div>
           <p className="mt-0.5 truncate text-[12.5px] leading-5 text-muted-foreground">{description}</p>
         </div>
@@ -3724,7 +7549,7 @@ function McpAppsCatalogRow({
       </div>
 
       {setupOpen && preset.install_supported && hasFields ? (
-        <div className="mx-3 mb-3 rounded-[14px] border border-border/45 bg-card/85 p-3 shadow-sm">
+        <div className="mx-3 mb-3 rounded-[14px] bg-background/55 p-3">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <div className="truncate text-[12.5px] font-semibold text-foreground">
@@ -3795,7 +7620,7 @@ function McpAppsCatalogRow({
       ) : null}
 
       {toolsOpen && readyInstalled && toolNames.length ? (
-        <div className="mx-3 mb-3 rounded-[14px] border border-border/45 bg-card/85 p-3 shadow-sm">
+        <div className="mx-3 mb-3 rounded-[14px] bg-background/55 p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="text-[11.5px] font-medium text-muted-foreground">
               {tx("settings.mcp.toolScope", "Tools")}
@@ -3852,7 +7677,7 @@ function McpAppsCatalogRow({
 
 function AppsTypeBadge({ children }: { children: ReactNode }) {
   return (
-    <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase leading-none tracking-[0.06em] text-muted-foreground">
+    <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium leading-none text-muted-foreground">
       {children}
     </span>
   );
@@ -3930,7 +7755,7 @@ function appsSearchText(item: AppsCatalogItem): string {
     preset.source ?? "",
   ]
     .join(" ")
-    .toLowerCase();
+      .toLowerCase();
 }
 
 function McpCustomServerPanel({
@@ -3968,7 +7793,7 @@ function McpCustomServerPanel({
   ];
 
   return (
-    <section className="overflow-hidden rounded-[16px] border border-border/45 bg-card/72 shadow-[0_10px_30px_rgba(15,23,42,0.045)]">
+    <section className="overflow-hidden rounded-[16px] bg-settings-surface">
       <div className="flex flex-col gap-3 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex min-w-0 items-center gap-3">
           <span className="grid h-9 w-9 shrink-0 place-items-center rounded-[11px] bg-muted text-muted-foreground">
@@ -3976,10 +7801,13 @@ function McpCustomServerPanel({
           </span>
           <div className="min-w-0">
             <h3 className="text-[13px] font-semibold leading-5 text-foreground">
-              {tx("settings.mcp.moreOptions", "More MCP options")}
+              {tx("settings.mcp.moreOptions", "Add integration")}
             </h3>
             <p className="truncate text-[12px] text-muted-foreground">
-              {tx("settings.mcp.moreOptionsSubtitle", "Add a custom server or import mcp.json.")}
+              {tx(
+                "settings.mcp.moreOptionsSubtitle",
+                "Connect a custom tool server or import an existing configuration.",
+              )}
             </p>
           </div>
         </div>
@@ -4185,10 +8013,9 @@ function mcpPresetStatusLabel(status: string, tx: (key: string, fallback: string
 }
 
 function McpPresetLogo({ preset, showBrandLogos }: { preset: McpPresetInfo; showBrandLogos: boolean }) {
-  const [logoIndex, setLogoIndex] = useState(0);
   const bg = preset.brand_color || "hsl(var(--muted))";
   const logoUrls = useMemo(() => logoFallbackUrls(preset.logo_url), [preset.logo_url]);
-  const logoUrl = logoUrls[logoIndex];
+  const { logoUrl, onLogoError, onLogoLoad } = useLogoFallback(logoUrls);
   const initials = preset.display_name
     .split(/\s+/)
     .filter(Boolean)
@@ -4196,19 +8023,19 @@ function McpPresetLogo({ preset, showBrandLogos }: { preset: McpPresetInfo; show
     .map((part) => part[0]?.toUpperCase())
     .join("") || preset.name.slice(0, 2).toUpperCase();
 
-  useEffect(() => setLogoIndex(0), [preset.logo_url]);
-
   if (showBrandLogos && logoUrl) {
     return (
       <span
         className="grid h-11 w-11 shrink-0 place-items-center rounded-[8px] border border-border/45 bg-background"
-        style={{ boxShadow: `inset 0 0 0 1px ${preset.brand_color ?? "transparent"}22` }}
       >
         <img
           src={logoUrl}
           alt=""
+          decoding="async"
+          loading="lazy"
           className="h-6 w-6 object-contain"
-          onError={() => setLogoIndex((index) => index + 1)}
+          onLoad={onLogoLoad}
+          onError={onLogoError}
         />
       </span>
     );
@@ -4247,12 +8074,7 @@ function CliAppReadyPanel({
   };
 
   return (
-    <section
-      className={cn(
-        "rounded-[12px] border border-border/55 bg-card/88 px-4 py-3",
-        "shadow-[0_8px_26px_rgba(15,23,42,0.055)]",
-      )}
-    >
+    <section className="rounded-[12px] bg-settings-surface px-4 py-3">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
         <CliAppLogo app={app} showBrandLogos={showBrandLogos} />
         <div className="min-w-0 flex-1">
@@ -4302,10 +8124,11 @@ function CliAppReadyPanel({
 }
 
 function CliAppLogo({ app, showBrandLogos }: { app: CliAppInfo; showBrandLogos: boolean }) {
-  const [logoIndex, setLogoIndex] = useState(0);
-  const bg = app.brand_color || "hsl(var(--muted))";
-  const logoUrls = useMemo(() => logoFallbackUrls(app.logo_url), [app.logo_url]);
-  const logoUrl = logoUrls[logoIndex];
+  const logoUrls = useMemo(
+    () => (isGenericRepositoryLogoUrl(app.logo_url) ? [] : logoFallbackUrls(app.logo_url)),
+    [app.logo_url],
+  );
+  const { logoUrl, logoLoaded, onLogoError, onLogoLoad } = useLogoFallback(logoUrls);
   const initials = app.display_name
     .split(/\s+/)
     .filter(Boolean)
@@ -4313,29 +8136,38 @@ function CliAppLogo({ app, showBrandLogos }: { app: CliAppInfo; showBrandLogos: 
     .map((part) => part[0]?.toUpperCase())
     .join("") || app.name.slice(0, 2).toUpperCase();
 
-  useEffect(() => setLogoIndex(0), [app.logo_url]);
+  const showRemoteLogo = showBrandLogos && Boolean(logoUrl);
 
-  if (showBrandLogos && logoUrl) {
-    return (
+  return (
+    <span
+      className="relative grid h-11 w-11 shrink-0 place-items-center overflow-hidden rounded-[8px] border border-border/45 bg-muted text-[13px] font-semibold"
+      style={{ color: app.brand_color || "hsl(var(--muted-foreground))" }}
+    >
       <span
-        className="grid h-11 w-11 shrink-0 place-items-center rounded-[8px] border border-border/45 bg-background"
-        style={{ boxShadow: `inset 0 0 0 1px ${app.brand_color ?? "transparent"}22` }}
+        aria-hidden
+        className={cn(
+          "transition-opacity duration-150 motion-reduce:transition-none",
+          showRemoteLogo && logoLoaded ? "opacity-0" : "opacity-100",
+        )}
       >
+        {initials}
+      </span>
+      {showRemoteLogo ? (
         <img
           src={logoUrl}
           alt=""
-          className="h-6 w-6 object-contain"
-          onError={() => setLogoIndex((index) => index + 1)}
+          decoding="async"
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          draggable={false}
+          className={cn(
+            "absolute h-6 w-6 object-contain transition-opacity duration-150 motion-reduce:transition-none",
+            logoLoaded ? "opacity-100" : "opacity-0",
+          )}
+          onLoad={onLogoLoad}
+          onError={onLogoError}
         />
-      </span>
-    );
-  }
-  return (
-    <span
-      className="grid h-11 w-11 shrink-0 place-items-center rounded-[8px] text-[13px] font-semibold text-white"
-      style={{ backgroundColor: bg }}
-    >
-      {initials}
+      ) : null}
     </span>
   );
 }
@@ -4350,6 +8182,16 @@ function RuntimeSettings({
   onRestart,
   isRestarting,
   requiresRestartPending,
+  apiService,
+  apiServiceLoading,
+  apiServiceAction,
+  apiServiceError,
+  langfuseFeature,
+  capabilitiesLoading,
+  capabilityAction,
+  capabilityError,
+  onApiServiceAction,
+  onInstallCapability,
 }: {
   form: AgentSettingsDraft;
   setForm: Dispatch<SetStateAction<AgentSettingsDraft>>;
@@ -4360,10 +8202,27 @@ function RuntimeSettings({
   onRestart?: () => void;
   isRestarting?: boolean;
   requiresRestartPending: boolean;
+  apiService: ApiServicePayload | null;
+  apiServiceLoading: boolean;
+  apiServiceAction: "start" | "stop" | null;
+  apiServiceError: string | null;
+  langfuseFeature?: NanobotFeatureInfo;
+  capabilitiesLoading: boolean;
+  capabilityAction: string | null;
+  capabilityError: string | null;
+  onApiServiceAction: (
+    action: "start" | "stop",
+    values?: { host: string; port: number; timeout: number; apiKey?: string },
+  ) => void;
+  onInstallCapability: (name: string) => void;
 }) {
   const { t } = useTranslation();
   const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
-  const isNativeHost = getHostApi() !== null || (settings.surface ?? settings.runtime_surface) === "native";
+  const runtimeSurface = settings.surface ?? settings.runtime_surface;
+  const runtimeHost = getRuntimeHost(runtimeSurface, settings.runtime_capabilities);
+  const openLogs = runtimeHost.openLogs;
+  const exportDiagnostics = runtimeHost.exportDiagnostics;
+  const isNativeHost = isNativeRuntime(runtimeSurface);
   const restartActionLabel = isNativeHost
     ? tx("app.system.restartEngine", "Restart engine")
     : t("app.system.restart");
@@ -4377,7 +8236,30 @@ function RuntimeSettings({
   } | null>(null);
   const [hostActionBusy, setHostActionBusy] =
     useState<"logs" | "diagnostics" | null>(null);
-  const hostApi = getHostApi();
+  const apiDefaults = apiService ?? {
+    installed: false,
+    running: false,
+    managed: false,
+    host: settings.api?.host ?? "127.0.0.1",
+    port: settings.api?.port ?? 8900,
+    timeout: settings.api?.timeout ?? 120,
+    api_key_hint: settings.api?.api_key_hint,
+    endpoint: `http://127.0.0.1:${settings.api?.port ?? 8900}/v1`,
+    command: "nanobot serve",
+  };
+  const [apiHost, setApiHost] = useState(apiDefaults.host);
+  const [apiPort, setApiPort] = useState(apiDefaults.port);
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeyVisible, setApiKeyVisible] = useState(false);
+  useEffect(() => {
+    if (!apiService) return;
+    setApiHost(apiService.host);
+    setApiPort(apiService.port);
+    setApiKey("");
+    setApiKeyVisible(false);
+  }, [apiService]);
+  const apiNetworkAccess = !isLoopbackHost(apiHost);
+  const apiMissingNetworkKey = apiNetworkAccess && !apiKey.trim() && !apiDefaults.api_key_hint;
   const engineState = isRestarting
     ? tx("settings.values.restartingEngine", "Restarting")
     : settings.apply_state?.status === "pending"
@@ -4385,11 +8267,11 @@ function RuntimeSettings({
       : tx("settings.values.ready", "Ready");
   const runHostAction = async (
     target: "logs" | "diagnostics",
-    action: () => Promise<string | void>,
+    action: (() => Promise<string | void>) | undefined,
     successMessage: (result: string | void) => string,
     failureMessage: string,
   ) => {
-    if (!hostApi) {
+    if (!action) {
       setHostActionMessage({
         target,
         message: tx(
@@ -4414,7 +8296,7 @@ function RuntimeSettings({
     <div className="space-y-7">
       <section>
         <SettingsSectionTitle>{tx("settings.sections.identity", "Identity")}</SettingsSectionTitle>
-        <SettingsGroup>
+          <SettingsGroup>
           <SettingsRow title={tx("settings.rows.botName", "Bot name")} description={tx("settings.help.botName", "Shown wherever nanobot uses a display name.")}>
             <Input
               value={form.botName}
@@ -4476,7 +8358,7 @@ function RuntimeSettings({
                   onClick={() =>
                     void runHostAction(
                       "logs",
-                      () => hostApi!.openLogs(),
+                      openLogs,
                       () => tx("settings.status.logsOpened", "Opened logs folder."),
                       tx("settings.status.logsOpenFailed", "Could not open logs folder."),
                     )
@@ -4507,11 +8389,11 @@ function RuntimeSettings({
                   onClick={() =>
                     void runHostAction(
                       "diagnostics",
-                      async () => {
-                        const path = await hostApi!.exportDiagnostics();
+                      exportDiagnostics ? async () => {
+                        const path = await exportDiagnostics();
                         setDiagnosticsPath(path);
                         return path;
-                      },
+                      } : undefined,
                       (path) =>
                         t("settings.status.diagnosticsExported", {
                           path: String(path ?? ""),
@@ -4532,6 +8414,171 @@ function RuntimeSettings({
           </SettingsGroup>
         </section>
       ) : null}
+
+      <section>
+        <SettingsSectionTitle>{tx("settings.api.title", "API server")}</SettingsSectionTitle>
+        <SettingsGroup>
+          <SettingsRow
+            title={tx("settings.api.openaiCompatible", "OpenAI-compatible API")}
+            description={
+              apiServiceError
+                ? apiServiceError
+                : apiDefaults.running
+                  ? apiDefaults.endpoint
+                  : tx("settings.api.description", "Connect SDKs and agents through a local /v1 endpoint.")
+            }
+          >
+            <div className="flex items-center justify-end gap-2">
+              <StatusPill tone={apiDefaults.running ? "success" : "neutral"}>
+                {apiServiceLoading
+                  ? tx("settings.values.checking", "Checking")
+                  : apiDefaults.running
+                    ? tx("settings.values.running", "Running")
+                    : tx("settings.values.off", "Off")}
+              </StatusPill>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={apiServiceLoading || apiServiceAction !== null || apiMissingNetworkKey}
+                onClick={() =>
+                  onApiServiceAction(
+                    apiDefaults.running ? "stop" : "start",
+                    apiDefaults.running
+                      ? undefined
+                      : {
+                          host: apiHost,
+                          port: apiPort,
+                          timeout: apiDefaults.timeout,
+                          apiKey: apiKey.trim() || undefined,
+                        },
+                  )
+                }
+                className="rounded-full"
+              >
+                {apiServiceAction ? (
+                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+                ) : apiDefaults.running ? (
+                  <PauseCircle className="mr-1.5 h-3.5 w-3.5" aria-hidden />
+                ) : (
+                  <PlayCircle className="mr-1.5 h-3.5 w-3.5" aria-hidden />
+                )}
+                {apiServiceAction === "start"
+                  ? tx("settings.api.starting", "Starting...")
+                  : apiServiceAction === "stop"
+                    ? tx("settings.api.stopping", "Stopping...")
+                    : apiDefaults.running
+                      ? tx("settings.api.stop", "Stop")
+                      : tx("settings.api.start", "Start API server")}
+              </Button>
+            </div>
+          </SettingsRow>
+          {!apiDefaults.running ? (
+            <>
+              <SettingsRow
+                title={tx("settings.api.access", "Access")}
+                description={
+                  apiNetworkAccess
+                    ? tx("settings.api.networkHelp", "Other devices can connect; an API key is required.")
+                    : tx("settings.api.localHelp", "Only this device can connect.")
+                }
+              >
+                <SegmentedControl
+                  value={apiNetworkAccess ? "network" : "local"}
+                  options={[
+                    { value: "local", label: tx("settings.api.thisDevice", "This device") },
+                    { value: "network", label: tx("settings.api.localNetwork", "Local network") },
+                  ]}
+                  onChange={(value) => setApiHost(value === "network" ? "0.0.0.0" : "127.0.0.1")}
+                />
+              </SettingsRow>
+              <SettingsRow
+                title={tx("settings.api.port", "Port")}
+                description={tx("settings.api.portHelp", "The API uses this local port.")}
+              >
+                <NumberInput value={apiPort} min={1} max={65535} onChange={setApiPort} />
+              </SettingsRow>
+              {apiNetworkAccess ? (
+                <SettingsRow
+                  title={tx("settings.api.apiKey", "API key")}
+                  description={
+                    apiMissingNetworkKey
+                      ? tx("settings.api.apiKeyRequired", "Required before exposing the API to your network.")
+                      : tx("settings.api.apiKeyHelp", "Clients send this as a Bearer token.")
+                  }
+                >
+                  <div className="relative w-[280px] max-w-full">
+                    <Input
+                      type={apiKeyVisible ? "text" : "password"}
+                      value={apiKey}
+                      onChange={(event) => setApiKey(event.target.value)}
+                      placeholder={apiDefaults.api_key_hint ?? tx("settings.api.apiKeyPlaceholder", "Enter an API key")}
+                      className="h-9 rounded-full pr-10 text-[13px]"
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setApiKeyVisible((visible) => !visible)}
+                      aria-label={apiKeyVisible ? tx("settings.byok.hideApiKey", "Hide API key") : tx("settings.byok.showApiKey", "Show API key")}
+                      className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 rounded-full"
+                    >
+                      {apiKeyVisible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    </Button>
+                  </div>
+                </SettingsRow>
+              ) : null}
+            </>
+          ) : null}
+        </SettingsGroup>
+        {!apiDefaults.installed && !apiDefaults.running ? (
+          <p className="mt-2 text-[11.5px] text-muted-foreground">
+            {tx("settings.api.autoInstall", "API support will be installed automatically when you start it.")}
+          </p>
+        ) : null}
+      </section>
+
+      <section>
+        <SettingsSectionTitle>{tx("settings.observability.title", "Observability")}</SettingsSectionTitle>
+        <SettingsGroup>
+          <SettingsRow
+            title="Langfuse"
+            description={
+              settings.observability?.configured
+                ? tx("settings.observability.configured", "Tracing credentials are available to nanobot.")
+                : tx(
+                    "settings.observability.environment",
+                    "Set LANGFUSE_SECRET_KEY and LANGFUSE_PUBLIC_KEY, then restart nanobot.",
+                  )
+            }
+          >
+            {capabilitiesLoading ? (
+              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-hidden />
+            ) : langfuseFeature?.installed ? (
+              <StatusPill tone={settings.observability?.configured ? "success" : "neutral"}>
+                {settings.observability?.configured
+                  ? tx("settings.values.ready", "Ready")
+                  : tx("settings.values.needsSetup", "Needs setup")}
+              </StatusPill>
+            ) : (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={capabilityAction === "enable:langfuse"}
+                onClick={() => onInstallCapability("langfuse")}
+                className="rounded-full"
+              >
+                {capabilityAction === "enable:langfuse" ? (
+                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
+                ) : null}
+                {capabilityAction === "enable:langfuse"
+                  ? tx("settings.capabilities.installing", "Installing support...")
+                  : tx("settings.observability.enable", "Enable tracing support")}
+              </Button>
+            )}
+          </SettingsRow>
+        </SettingsGroup>
+        {capabilityError ? <p className="mt-2 text-[12px] text-destructive">{capabilityError}</p> : null}
+      </section>
 
       <section>
         <SettingsSectionTitle>{t("settings.sections.system")}</SettingsSectionTitle>
@@ -4827,15 +8874,23 @@ function ModelIdPicker({
   token,
   settings,
   provider,
+  models,
   value,
   showProviderLogos,
+  emptyLabel,
+  searchPlaceholder,
+  emptyMessage,
   onChange,
 }: {
   token: string;
   settings: SettingsPayload;
   provider: string;
+  models?: string[];
   value: string;
   showProviderLogos: boolean;
+  emptyLabel?: string;
+  searchPlaceholder?: string;
+  emptyMessage?: string;
   onChange: (model: string) => void;
 }) {
   const { t } = useTranslation();
@@ -4848,19 +8903,29 @@ function ModelIdPicker({
   const effectiveProvider =
     provider === "auto" ? settings.agent.resolved_provider ?? provider : provider;
   const hasConcreteProvider = Boolean(effectiveProvider && effectiveProvider !== "auto");
+  const hasStaticModels = models !== undefined;
   const providerRow = settingsProviderRow(settings, effectiveProvider);
   const providerConfigured = settingsProviderConfigured(settings, effectiveProvider);
-  const providerRequiresConfiguration = hasConcreteProvider && !providerConfigured;
+  const providerRequiresConfiguration =
+    !hasStaticModels && hasConcreteProvider && !providerConfigured;
+  const providerHasBuiltinModels = providerRow?.model_catalog === "builtin";
   const providerUsesManualModelIds =
-    hasConcreteProvider && providerConfigured && providerRow?.auth_type === "oauth";
+    !hasStaticModels &&
+    hasConcreteProvider &&
+    providerConfigured &&
+    providerRow?.auth_type === "oauth" &&
+    !providerHasBuiltinModels;
   const canFetchModels =
+    !hasStaticModels &&
     hasConcreteProvider && providerConfigured && !providerUsesManualModelIds;
   const normalizedQuery = query.trim().toLowerCase();
-  const providerModels = payload?.models ?? [];
+  const providerModels: ProviderModelsPayload["models"] = hasStaticModels
+    ? (models?.map((id) => ({ id })) ?? [])
+    : (payload?.models ?? []);
   const visibleModels = providerModels
     .filter((model) => {
       if (!normalizedQuery) return true;
-      return [model.id, model.label ?? "", model.owned_by ?? ""]
+      return [model.id, model.label ?? "", model.description ?? "", model.owned_by ?? ""]
         .some((field) => field.toLowerCase().includes(normalizedQuery));
     })
     .slice(0, 80);
@@ -4872,8 +8937,10 @@ function ModelIdPicker({
     canFetchModels && (!defersModelList || hasDeferredSearchQuery);
   const waitingForModelSearch =
     open && canFetchModels && defersModelList && !hasDeferredSearchQuery;
-  const hasModelList = payload?.status === "available";
-  const showModels = Boolean(hasModelList && payload && (!isCatalog || normalizedQuery));
+  const hasModelList = hasStaticModels || payload?.status === "available";
+  const showModels = Boolean(
+    hasModelList && (hasStaticModels || (payload && (!isCatalog || normalizedQuery))),
+  );
   const customCandidate = query.trim();
   const allowCustomModel = !providerRequiresConfiguration;
   const exactQueryMatch = providerModels.some((model) => model.id === customCandidate);
@@ -4935,8 +9002,17 @@ function ModelIdPicker({
           showBrandLogos={showProviderLogos}
           unconfigured={!providerConfigured}
         />
-        <span className="min-w-0 truncate font-medium text-foreground">
-          {model.label ?? model.id}
+        <span className="min-w-0">
+          <span className="block truncate font-medium text-foreground">
+            {model.label ?? model.id}
+          </span>
+          {model.description || (model.label && model.label !== model.id) ? (
+            <span className="mt-0.5 block truncate text-[10.5px] text-muted-foreground">
+              {[model.label && model.label !== model.id ? model.id : null, model.description]
+                .filter(Boolean)
+                .join(" · ")}
+            </span>
+          ) : null}
         </span>
       </span>
       <span className="ml-2 flex shrink-0 items-center gap-2 text-[11px] text-muted-foreground">
@@ -4969,7 +9045,7 @@ function ModelIdPicker({
                 value ? "text-foreground" : "text-muted-foreground",
               )}
             >
-              {value || tx("settings.models.selectModel", "Select model")}
+              {value || emptyLabel || tx("settings.models.selectModel", "Select model")}
             </span>
           </span>
           <ChevronDown className="ml-2 h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
@@ -4988,8 +9064,19 @@ function ModelIdPicker({
             <Input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => event.stopPropagation()}
-              placeholder={tx("settings.models.searchModels", "Search or type model ID")}
+              onKeyDown={(event) => {
+                event.stopPropagation();
+                if (event.key === "Enter" && allowCustomModel && customCandidate) {
+                  event.preventDefault();
+                  selectModel(customCandidate);
+                }
+              }}
+              placeholder={
+                searchPlaceholder || tx("settings.models.searchModels", "Search or type model ID")
+              }
+              aria-label={
+                searchPlaceholder || tx("settings.models.searchModels", "Search or type model ID")
+              }
               className="h-8 rounded-full pl-8 pr-3 text-[12px]"
             />
           </div>
@@ -4998,6 +9085,10 @@ function ModelIdPicker({
         {providerRequiresConfiguration ? (
           <div className="px-2 py-1.5 text-[11px] leading-4 text-muted-foreground">
             {tx("settings.models.providerNotConfigured", "Configure this provider before loading models.")}
+          </div>
+        ) : hasStaticModels && !providerModels.length ? (
+          <div className="px-2 py-1.5 text-[11px] leading-4 text-muted-foreground">
+            {emptyMessage || tx("settings.models.unsupportedModelList", "Type a model ID manually.")}
           </div>
         ) : providerUsesManualModelIds ? (
           <div className="px-2 py-1.5 text-[11px] leading-4 text-muted-foreground">
@@ -5081,6 +9172,13 @@ function formatContextWindow(tokens: number): string {
   return String(tokens);
 }
 
+function formatModelContextWindow(tokens: number): string {
+  if (tokens === 65_536) return "64K";
+  if (tokens === 262_144) return "256K";
+  if (tokens === 1_048_576) return "1M";
+  return formatContextWindow(tokens);
+}
+
 function ProviderPickerIcon({
   provider,
   showBrandLogos,
@@ -5090,12 +9188,9 @@ function ProviderPickerIcon({
   showBrandLogos: boolean;
   unconfigured?: boolean;
 }) {
-  const [logoIndex, setLogoIndex] = useState(0);
   const brand = providerBrand(provider);
   const Icon = PROVIDER_ICONS[provider] ?? Hexagon;
-  const logoUrl = brand?.logoUrls[logoIndex];
-
-  useEffect(() => setLogoIndex(0), [provider]);
+  const { logoUrl, onLogoError, onLogoLoad } = useLogoFallback(brand?.logoUrls);
 
   if (unconfigured) {
     return (
@@ -5113,15 +9208,17 @@ function ProviderPickerIcon({
     return (
       <span
         data-testid={`provider-picker-logo-${provider}`}
-        className="grid h-5 w-5 shrink-0 place-items-center overflow-hidden rounded-md border border-border/35 bg-background shadow-[inset_0_0_0_1px_rgba(0,0,0,0.02)]"
-        style={{ boxShadow: `inset 0 0 0 1px ${brand.color}22` }}
+        className="grid h-5 w-5 shrink-0 place-items-center overflow-hidden rounded-md border border-border/35 bg-background"
         aria-hidden
       >
         <img
           src={logoUrl}
           alt=""
+          decoding="async"
+          loading="lazy"
           className="h-3.5 w-3.5 object-contain"
-          onError={() => setLogoIndex((index) => index + 1)}
+          onLoad={onLogoLoad}
+          onError={onLogoError}
         />
       </span>
     );
@@ -5131,7 +9228,7 @@ function ProviderPickerIcon({
     return (
       <span
         data-testid={`provider-picker-logo-fallback-${provider}`}
-        className="grid h-5 w-5 shrink-0 place-items-center rounded-md text-[7.5px] font-semibold text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.18)]"
+        className="grid h-5 w-5 shrink-0 place-items-center rounded-md text-[7.5px] font-semibold text-white"
         style={{ backgroundColor: brand.color }}
         aria-hidden
       >
@@ -5147,52 +9244,6 @@ function ProviderPickerIcon({
     >
       <Icon className="h-3 w-3" strokeWidth={2} />
     </span>
-  );
-}
-
-function ProviderSection({
-  title,
-  count,
-  empty,
-  children,
-}: {
-  title: string;
-  count: number;
-  empty: string;
-  children: ReactNode;
-}) {
-  return (
-    <section className="space-y-3">
-      <ByokSectionHeader title={title} count={count} />
-      <div className="overflow-hidden rounded-[22px] border border-border/45 bg-card/86 shadow-[0_18px_65px_rgba(15,23,42,0.07)] backdrop-blur-xl dark:border-white/10 dark:shadow-[0_18px_65px_rgba(0,0,0,0.22)]">
-        {count > 0 ? (
-          <div className="divide-y divide-border/45">{children}</div>
-        ) : (
-          <ByokEmptyState>{empty}</ByokEmptyState>
-        )}
-      </div>
-    </section>
-  );
-}
-
-function ByokSectionHeader({ title, count }: { title: string; count: number }) {
-  return (
-    <div className="flex items-center justify-between px-1">
-      <h2 className="text-[13px] font-semibold tracking-[-0.01em] text-foreground/85">
-        {title}
-      </h2>
-      <span className="rounded-full bg-muted px-2 py-0.5 text-[11.5px] font-medium text-muted-foreground">
-        {count}
-      </span>
-    </div>
-  );
-}
-
-function ByokEmptyState({ children }: { children: ReactNode }) {
-  return (
-    <div className="rounded-[18px] border border-dashed border-border/65 bg-card/45 px-4 py-5 text-[13px] text-muted-foreground">
-      {children}
-    </div>
   );
 }
 
@@ -5236,19 +9287,6 @@ function providerVisibilityRank(provider: SettingsPayload["providers"][number]):
   if (localRank !== undefined) return localRank;
   if ((provider.api_key_required ?? true) === false) return 100;
   return 200;
-}
-
-function filterProviders(
-  providers: SettingsPayload["providers"],
-  query: string,
-): SettingsPayload["providers"] {
-  const normalized = query.trim().toLowerCase();
-  if (!normalized) return providers;
-  return providers.filter((provider) =>
-    `${provider.name} ${provider.label} ${provider.api_base ?? ""} ${provider.default_api_base ?? ""}`
-      .toLowerCase()
-      .includes(normalized),
-  );
 }
 
 interface TimezoneOption {
@@ -5322,7 +9360,12 @@ function modelPresetProviderKey(
 ): string {
   const provider = options.draftProvider ?? preset.provider;
   if (provider === "auto") {
-    return settings.agent.resolved_provider || settings.agent.provider || preset.provider;
+    return (
+      preset.resolved_provider ||
+      settings.agent.resolved_provider ||
+      settings.agent.provider ||
+      preset.provider
+    );
   }
   return provider;
 }
@@ -5337,6 +9380,7 @@ const PROVIDER_ICONS: Record<string, LucideIcon> = {
   deepseek: Waves,
   zhipu: Grid3X3,
   dashscope: Cloud,
+  modelscope: Layers,
   moonshot: Moon,
   minimax: Zap,
   minimax_anthropic: Brain,
@@ -5377,25 +9421,24 @@ function ProviderIcon({
   provider: string;
   showBrandLogos: boolean;
 }) {
-  const [logoIndex, setLogoIndex] = useState(0);
   const brand = providerBrand(provider);
   const Icon = PROVIDER_ICONS[provider] ?? Hexagon;
-  const logoUrl = brand?.logoUrls[logoIndex];
-
-  useEffect(() => setLogoIndex(0), [provider]);
+  const { logoUrl, onLogoError, onLogoLoad } = useLogoFallback(brand?.logoUrls);
 
   if (showBrandLogos && logoUrl) {
     return (
       <span
         data-testid={`provider-logo-${provider}`}
-        className="grid h-10 w-10 shrink-0 place-items-center overflow-hidden rounded-[14px] border border-border/45 bg-background shadow-[inset_0_0_0_1px_rgba(0,0,0,0.025)]"
-        style={{ boxShadow: `inset 0 0 0 1px ${brand.color}22` }}
+        className="grid h-10 w-10 shrink-0 place-items-center overflow-hidden rounded-[14px] border border-border/45 bg-background"
       >
         <img
           src={logoUrl}
           alt=""
+          decoding="async"
+          loading="lazy"
           className="h-6 w-6 object-contain"
-          onError={() => setLogoIndex((index) => index + 1)}
+          onLoad={onLogoLoad}
+          onError={onLogoError}
         />
       </span>
     );
@@ -5404,7 +9447,7 @@ function ProviderIcon({
     return (
       <span
         data-testid={`provider-logo-fallback-${provider}`}
-        className="grid h-10 w-10 shrink-0 place-items-center rounded-[14px] text-[11px] font-semibold text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.18)]"
+        className="grid h-10 w-10 shrink-0 place-items-center rounded-[14px] text-[11px] font-semibold text-white"
         style={{ backgroundColor: brand.color }}
         aria-hidden
       >
@@ -5413,7 +9456,7 @@ function ProviderIcon({
     );
   }
   return (
-    <span className="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-muted text-foreground/82 shadow-[inset_0_0_0_1px_rgba(0,0,0,0.025)] dark:bg-muted/70">
+    <span className="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-muted text-foreground/82 dark:bg-muted/70">
       <Icon className="h-5 w-5" strokeWidth={2} aria-hidden />
     </span>
   );
@@ -5438,11 +9481,8 @@ function OverviewValueLogo({
   provider: string | null | undefined;
   showBrandLogos: boolean;
 }) {
-  const [logoIndex, setLogoIndex] = useState(0);
   const brand = provider ? providerBrand(provider) : null;
-  const logoUrl = brand?.logoUrls[logoIndex];
-
-  useEffect(() => setLogoIndex(0), [provider]);
+  const { logoUrl, onLogoError, onLogoLoad } = useLogoFallback(brand?.logoUrls);
 
   if (!provider || !showBrandLogos || !brand) return null;
 
@@ -5450,15 +9490,17 @@ function OverviewValueLogo({
     return (
       <span
         data-testid={`overview-logo-${provider}`}
-        className="grid h-5 w-5 shrink-0 place-items-center overflow-hidden rounded-md border border-border/35 bg-background shadow-[inset_0_0_0_1px_rgba(0,0,0,0.02)]"
-        style={{ boxShadow: `inset 0 0 0 1px ${brand.color}22` }}
+        className="grid h-5 w-5 shrink-0 place-items-center overflow-hidden rounded-md border border-border/35 bg-background"
         aria-hidden
       >
         <img
           src={logoUrl}
           alt=""
+          decoding="async"
+          loading="lazy"
           className="h-3.5 w-3.5 object-contain"
-          onError={() => setLogoIndex((index) => index + 1)}
+          onLoad={onLogoLoad}
+          onError={onLogoError}
         />
       </span>
     );
@@ -5467,7 +9509,7 @@ function OverviewValueLogo({
   return (
     <span
       data-testid={`overview-logo-fallback-${provider}`}
-      className="grid h-5 w-5 shrink-0 place-items-center rounded-md text-[7.5px] font-semibold text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.18)]"
+      className="grid h-5 w-5 shrink-0 place-items-center rounded-md text-[7.5px] font-semibold text-white"
       style={{ backgroundColor: brand.color }}
       aria-hidden
     >
@@ -5528,7 +9570,7 @@ function SettingsSectionTitle({ children }: { children: ReactNode }) {
 
 function SettingsGroup({ children }: { children: ReactNode }) {
   return (
-    <div className="overflow-hidden rounded-[22px] border border-border/45 bg-card/86 shadow-[0_18px_65px_rgba(15,23,42,0.075)] backdrop-blur-xl dark:border-white/10 dark:shadow-[0_18px_65px_rgba(0,0,0,0.24)]">
+    <div className="overflow-hidden rounded-[22px] bg-settings-surface">
       <div className="divide-y divide-border/45">{children}</div>
     </div>
   );
@@ -5553,7 +9595,7 @@ function SettingsRow({
           </div>
         ) : null}
       </div>
-      {children ? <div className="shrink-0 sm:ml-6">{children}</div> : null}
+      {children ? <div className="min-w-0 sm:ml-6 sm:shrink-0">{children}</div> : null}
     </div>
   );
 }
@@ -5569,177 +9611,10 @@ function ReadOnlyRow({
 }) {
   return (
     <SettingsRow title={title} description={description}>
-      <span className="block max-w-[320px] truncate text-right text-[13px] text-muted-foreground">
+      <span className="block max-w-full truncate text-left text-[13px] text-muted-foreground sm:max-w-[320px] sm:text-right">
         {value}
       </span>
     </SettingsRow>
-  );
-}
-
-function ModelPresetPicker({
-  presets,
-  value,
-  settings,
-  draftModel,
-  draftProvider,
-  providerConfigured,
-  showProviderLogos,
-  onChange,
-  onCreateConfiguration,
-}: {
-  presets: SettingsPayload["model_presets"];
-  value: string;
-  settings: SettingsPayload;
-  draftModel: string;
-  draftProvider: string;
-  providerConfigured: boolean;
-  showProviderLogos: boolean;
-  onChange: (preset: string) => void;
-  onCreateConfiguration: () => void;
-}) {
-  const { t } = useTranslation();
-  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
-  const selectedPreset = presets.find((preset) => preset.name === value) ?? presets[0] ?? null;
-
-  return (
-    <DropdownMenu modal={false}>
-      <DropdownMenuTrigger asChild disabled={!presets.length}>
-        <Button
-          type="button"
-          variant="outline"
-          aria-label={tx("settings.rows.currentModel", "Current configuration")}
-          disabled={!presets.length}
-          className={cn(
-            "h-12 w-[min(430px,72vw)] justify-between rounded-full border-input bg-background px-3.5 text-[13px] font-normal shadow-none",
-            "hover:bg-accent/55 focus-visible:ring-2 focus-visible:ring-ring",
-          )}
-        >
-          {selectedPreset ? (
-            <ModelPresetOptionContent
-              preset={selectedPreset}
-              settings={settings}
-              draftModel={draftModel}
-              draftProvider={draftProvider}
-              forceUnconfigured={selectedPreset?.is_default ? !providerConfigured : undefined}
-              showProviderLogos={showProviderLogos}
-              compact
-            />
-          ) : (
-            <span className="truncate text-muted-foreground">
-              {tx("settings.models.selectModel", "Select model")}
-            </span>
-          )}
-          <ChevronDown className="ml-2 h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="end"
-        className="max-h-[20rem] w-[430px] max-w-[calc(100vw-2rem)] overflow-y-auto scrollbar-thin scrollbar-track-transparent"
-      >
-        {presets.map((preset) => {
-          const selected = preset.name === value;
-          return (
-            <DropdownMenuItem
-              key={preset.name}
-              onSelect={() => onChange(preset.name)}
-              className={cn(
-                "flex cursor-default items-center justify-between gap-3 rounded-[12px] px-2.5 py-2 text-[13px]",
-                "focus:bg-muted/85 focus:text-foreground",
-                selected && "bg-muted/80 text-foreground focus:bg-muted",
-              )}
-            >
-              <ModelPresetOptionContent
-                preset={preset}
-                settings={settings}
-                draftModel={draftModel}
-                draftProvider={draftProvider}
-                showProviderLogos={showProviderLogos}
-              />
-              {selected ? <Check className="h-3.5 w-3.5 shrink-0" aria-hidden /> : null}
-            </DropdownMenuItem>
-          );
-        })}
-        <div className="mt-1 border-t border-border/55 pt-1">
-          <DropdownMenuItem
-            onSelect={() => {
-              window.setTimeout(onCreateConfiguration, 0);
-            }}
-            className={cn(
-              "flex cursor-default items-center gap-2 rounded-[12px] px-2.5 py-2 text-[13px] font-medium",
-              "text-foreground focus:bg-muted/85 focus:text-foreground",
-            )}
-          >
-            <span className="grid h-5 w-5 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
-              <Plus className="h-3.5 w-3.5" aria-hidden />
-            </span>
-            <span>{tx("settings.models.addConfiguration", "Add configuration")}</span>
-          </DropdownMenuItem>
-        </div>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
-function ModelPresetOptionContent({
-  preset,
-  settings,
-  draftModel,
-  draftProvider,
-  forceUnconfigured,
-  showProviderLogos,
-  compact = false,
-}: {
-  preset: SettingsPayload["model_presets"][number];
-  settings: SettingsPayload;
-  draftModel: string;
-  draftProvider: string;
-  forceUnconfigured?: boolean;
-  showProviderLogos: boolean;
-  compact?: boolean;
-}) {
-  const { t } = useTranslation();
-  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
-  const provider = modelPresetProviderKey(preset, settings, {
-    draftProvider: preset.is_default ? draftProvider : undefined,
-  });
-  const model = preset.is_default ? draftModel : preset.model;
-  const providerName = providerDisplayLabel(settings.providers, provider);
-  const providerConfigured =
-    forceUnconfigured === undefined
-      ? settingsProviderConfigured(settings, provider)
-      : !forceUnconfigured;
-  const title = providerConfigured ? model || preset.label : tx("settings.values.notConfigured", "Not configured");
-  const caption = providerConfigured
-    ? `${providerName}${preset.label ? ` · ${preset.label}` : ""}`
-    : providerName || model || preset.label
-      ? [providerName, model || preset.label].filter(Boolean).join(" · ")
-      : tx("settings.byok.noConfiguredProviders", "No configured providers");
-  return (
-    <span className="flex min-w-0 items-center gap-2.5">
-      <ProviderPickerIcon
-        provider={provider}
-        showBrandLogos={showProviderLogos}
-        unconfigured={!providerConfigured}
-      />
-      <span className="min-w-0 text-left leading-tight">
-        <span
-          className={cn(
-            "block truncate font-medium",
-            providerConfigured ? "text-foreground" : "text-amber-800 dark:text-amber-200",
-          )}
-        >
-          {title}
-        </span>
-        <span
-          className={cn(
-            "mt-0.5 block truncate text-muted-foreground",
-            compact ? "text-[11.5px]" : "text-[12px]",
-          )}
-        >
-          {caption}
-        </span>
-      </span>
-    </span>
   );
 }
 
@@ -5770,7 +9645,7 @@ function RestartSettingsFooter({
 }) {
   const { t } = useTranslation();
   const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
-  const isNativeHost = getHostApi() !== null;
+  const isNativeHost = isNativeRuntime();
   const restartLabel = isNativeHost
     ? tx("app.system.restartEngine", "Restart engine")
     : t("app.system.restart");
@@ -5833,44 +9708,6 @@ function RestartSettingsFooter({
   );
 }
 
-function SettingsFooter({
-  dirty,
-  saving,
-  saved,
-  disabled = false,
-  message,
-  onSave,
-}: {
-  dirty: boolean;
-  saving: boolean;
-  saved: boolean;
-  disabled?: boolean;
-  message?: string;
-  onSave: () => void;
-}) {
-  const { t } = useTranslation();
-  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
-  const statusMessage = message ?? (dirty
-    ? t("settings.status.unsaved")
-    : saved
-      ? t("settings.status.savedRestart")
-      : tx("settings.status.upToDate", "Up to date."));
-  return (
-    <div className="flex min-h-[58px] flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5">
-      <div className="text-[13px] text-muted-foreground">
-        <SettingsStatusMessage tone={disabled ? "danger" : dirty || saved ? "accent" : undefined}>
-          {statusMessage}
-        </SettingsStatusMessage>
-      </div>
-      <div className="flex justify-end">
-        <Button size="sm" variant="outline" onClick={onSave} disabled={!dirty || disabled || saving} className="rounded-full">
-          {saving ? t("settings.actions.saving") : t("settings.actions.save")}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 function SettingsStatusMessage({
   children,
   tone,
@@ -5892,7 +9729,7 @@ function SettingsStatusMessage({
           className={cn(
             "h-1.5 w-1.5 shrink-0 rounded-full",
             tone === "accent" &&
-              "bg-blue-500 shadow-[0_0_0_3px_rgba(59,130,246,0.14)] dark:bg-blue-400 dark:shadow-[0_0_0_3px_rgba(96,165,250,0.18)]",
+              "bg-blue-500 dark:bg-blue-400",
             tone === "danger" && "bg-destructive/70",
           )}
           aria-hidden
@@ -5939,55 +9776,18 @@ function SegmentedControl({
         <button
           key={option.value}
           type="button"
+          aria-pressed={value === option.value}
           onClick={() => onChange(option.value)}
           className={cn(
             "rounded-full px-3 py-1 transition-colors",
-            value === option.value && "bg-background text-foreground shadow-sm",
+            value === option.value &&
+              "bg-background text-foreground ring-1 ring-inset ring-border/45",
           )}
         >
           {option.label}
         </button>
       ))}
     </div>
-  );
-}
-
-function ToggleButton({
-  checked,
-  onChange,
-  ariaLabel,
-  label,
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-  ariaLabel?: string;
-  label: string;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={ariaLabel ?? label}
-      onClick={() => onChange(!checked)}
-      className={cn(
-        "relative inline-flex h-[22px] w-[38px] shrink-0 items-center rounded-full p-[2px]",
-        "transition-colors duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
-        checked
-          ? "bg-[#2997FF] shadow-[inset_0_0_0_1px_rgba(0,0,0,0.035)]"
-          : "bg-muted shadow-[inset_0_0_0_1px_rgba(0,0,0,0.035)] hover:bg-muted/80",
-      )}
-    >
-      <span
-        aria-hidden
-        className={cn(
-          "h-[18px] w-[18px] rounded-full bg-background shadow-[0_1px_2px_rgba(0,0,0,0.18),0_2px_7px_rgba(0,0,0,0.11)]",
-          "transition-transform duration-200 ease-out",
-          checked ? "translate-x-[16px]" : "translate-x-0",
-        )}
-      />
-      <span className="sr-only">{label}</span>
-    </button>
   );
 }
 
@@ -6015,7 +9815,7 @@ function NumberInput({
           const parsed = Number(event.target.value);
           if (Number.isFinite(parsed)) onChange(parsed);
         }}
-        className="h-8 w-24 rounded-full text-[13px]"
+        className="h-8 w-24 max-w-full rounded-full text-[13px]"
       />
       {suffix ? <span className="text-[12px] text-muted-foreground">{suffix}</span> : null}
     </div>

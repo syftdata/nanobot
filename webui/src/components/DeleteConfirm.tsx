@@ -80,16 +80,16 @@ export function DeleteConfirm({
             </div>
           ) : null}
         </AlertDialogHeader>
-        <AlertDialogFooter className="mt-7 grid grid-cols-2 gap-3 space-x-0">
+        <AlertDialogFooter className="mt-7 !grid grid-cols-1 gap-3 space-x-0 sm:grid-cols-2 sm:space-x-0">
           <AlertDialogCancel
             onClick={onCancel}
-            className="mt-0 h-11 rounded-full border-0 bg-muted/70 px-5 text-[15px] font-semibold text-foreground shadow-none hover:bg-muted"
+            className="mt-0 h-11 w-full min-w-0 rounded-full border-0 bg-muted/70 px-5 text-[15px] font-semibold text-foreground shadow-none hover:bg-muted"
           >
             {t("deleteConfirm.cancel")}
           </AlertDialogCancel>
           <AlertDialogAction
             onClick={onConfirm}
-            className="h-11 rounded-full bg-destructive px-5 text-[15px] font-semibold text-destructive-foreground shadow-[0_10px_25px_rgba(239,68,68,0.28)] hover:bg-destructive/90"
+            className="h-11 w-full min-w-0 !whitespace-normal rounded-full bg-destructive px-5 text-center text-[15px] font-semibold text-destructive-foreground shadow-[0_10px_25px_rgba(239,68,68,0.28)] hover:bg-destructive/90"
           >
             {hasAutomations
               ? t("deleteConfirm.confirmWithAutomations")
@@ -122,6 +122,9 @@ function formatAutomationSchedule(
         })
       : t("deleteConfirm.schedule.cron", { expr: job.schedule.expr });
   }
+  if (job.schedule.kind === "local" || job.payload.kind === "local_trigger") {
+    return t("deleteConfirm.schedule.local", { defaultValue: "Local trigger" });
+  }
   return t("deleteConfirm.schedule.unknown");
 }
 
@@ -131,6 +134,9 @@ function formatAutomationNextRun(
   locale: string,
 ): string {
   if (!job.enabled) return t("deleteConfirm.next.disabled");
+  if (job.schedule.kind === "local" || job.payload.kind === "local_trigger") {
+    return t("deleteConfirm.next.local", { defaultValue: "Waiting for trigger" });
+  }
   const next = job.state.next_run_at_ms;
   if (!next) return t("deleteConfirm.next.none");
   return t("deleteConfirm.next.label", { time: fmtDateTime(next, locale) });

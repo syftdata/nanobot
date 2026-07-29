@@ -6,7 +6,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nanobot.command.builtin import register_builtin_commands
+from nanobot.command.builtin import (
+    builtin_command_starts_agent_turn,
+    register_builtin_commands,
+)
 from nanobot.command.router import CommandContext, CommandRouter
 
 
@@ -26,12 +29,14 @@ class TestIsDispatchableCommand:
         assert router.is_dispatchable_command("/dream")
         assert router.is_dispatchable_command("/dream-log")
         assert router.is_dispatchable_command("/dream-restore")
+        assert router.is_dispatchable_command("/dream-prompt")
         assert router.is_dispatchable_command("/goal")
         assert router.is_dispatchable_command("/pairing")
 
     def test_prefix_commands_match(self, router: CommandRouter) -> None:
         assert router.is_dispatchable_command("/dream-log abc123")
         assert router.is_dispatchable_command("/dream-restore def456")
+        assert router.is_dispatchable_command("/dream-prompt init")
         assert router.is_dispatchable_command("/model fast")
         assert router.is_dispatchable_command("/goal migrate the database")
         assert router.is_dispatchable_command("/pairing list")
@@ -60,6 +65,20 @@ class TestIsDispatchableCommand:
     def test_unknown_slash_command_not_matched(self, router: CommandRouter) -> None:
         assert not router.is_dispatchable_command("/unknown")
         assert not router.is_dispatchable_command("/foo bar")
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("/status", False),
+        ("/history 5", False),
+        ("/goal", False),
+        ("/goal migrate the database", True),
+        ("regular prompt", True),
+    ],
+)
+def test_builtin_command_agent_turn_lifecycle(content: str, expected: bool) -> None:
+    assert builtin_command_starts_agent_turn(content) is expected
 
 
 class TestMidTurnCommandDispatchedDirectly:
