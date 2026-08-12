@@ -682,9 +682,21 @@ async def connect_mcp_servers(
                 return name, None
 
             session = await server_stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
+            # Bound the handshake. `_probe_http_url` only proves the TCP port is
+            # open — a server that accepts the connection and then never answers
+            # (e.g. a dev server wedged mid-compile) leaves `initialize()` and
+            # `list_tools()` pending forever. Because `AgentLoop.run()` awaits
+            # `_connect_mcp()` *before* it starts consuming the inbound queue,
+            # one such server used to mute the whole agent: messages arrived,
+            # got queued, and nothing ever drained them. TimeoutError is a plain
+            # Exception, so the handler below closes the stack and we carry on
+            # without this server — which is what the "will retry next message"
+            # path already intended.
+            await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout)
 
-            tools = await session.list_tools()
+            tools = await asyncio.wait_for(
+                session.list_tools(), timeout=cfg.connect_timeout
+            )
             enabled_tools = set(cfg.enabled_tools)
             allow_all_tools = "*" in enabled_tools
             registered_count = 0
@@ -727,7 +739,9 @@ async def connect_mcp_servers(
                     )
 
             try:
-                resources_result = await session.list_resources()
+                resources_result = await asyncio.wait_for(
+                    session.list_resources(), timeout=cfg.connect_timeout
+                )
                 for resource in resources_result.resources:
                     wrapper = MCPResourceWrapper(
                         session, name, resource, resource_timeout=cfg.tool_timeout
@@ -741,7 +755,9 @@ async def connect_mcp_servers(
                 logger.debug("MCP server '{}': resources not supported or failed: {}", name, e)
 
             try:
-                prompts_result = await session.list_prompts()
+                prompts_result = await asyncio.wait_for(
+                    session.list_prompts(), timeout=cfg.connect_timeout
+                )
                 for prompt in prompts_result.prompts:
                     wrapper = MCPPromptWrapper(
                         session, name, prompt, prompt_timeout=cfg.tool_timeout
@@ -756,6 +772,17 @@ async def connect_mcp_servers(
                 "MCP server '{}': connected, {} capabilities registered", name, registered_count
             )
             return name, server_stack
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP server '{}': handshake timed out after {}s (port is open but the "
+                "server never answered) — continuing without it; will retry next message",
+                name,
+                cfg.connect_timeout,
+            )
+            with suppress(Exception):
+                await server_stack.aclose()
+            return name, None
 
         except Exception as e:
             hint = ""
