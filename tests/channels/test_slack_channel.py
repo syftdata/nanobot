@@ -677,11 +677,109 @@ def test_slack_download_rejects_login_html() -> None:
 
 
 def test_slack_download_failure_marker_is_actionable() -> None:
-    marker = SlackChannel._download_failure_marker("image", "screenshot.png", "download failed")
+    channel = SlackChannel(SlackConfig(enabled=True), MessageBus())
+    marker = channel._download_failure_marker("image", "screenshot.png", "download failed")
 
-    assert "not available to nanobot" in marker
+    # A generic failure is not a permission problem — it must not send the user
+    # off to re-do OAuth for what may be a transient network error.
+    assert "not available" in marker
+    assert "re-sharing" in marker
+    assert "permission" not in marker.lower()
+
+
+def test_permission_marker_points_at_the_connect_url() -> None:
+    channel = SlackChannel(
+        SlackConfig(
+            enabled=True,
+            permissions_help_url="https://app.syftdata.com/dashboard/settings/integrations?connect=slack",
+        ),
+        MessageBus(),
+    )
+    marker = channel._permission_marker(
+        "file", "pipeline.csv", "read files you upload", scope="files:read"
+    )
+
+    assert "pipeline.csv" in marker
+    assert "I don't have permission to read files you upload" in marker
     assert "files:read" in marker
-    assert "reinstall the Slack app" in marker
+    assert "https://app.syftdata.com/dashboard/settings/integrations?connect=slack" in marker
+
+
+def test_permission_ask_degrades_without_a_configured_url() -> None:
+    channel = SlackChannel(SlackConfig(enabled=True), MessageBus())
+    sentence = channel._reauthorize_sentence("read files you upload", scope="files:read")
+
+    assert "reconnect the Slack app" in sentence
+    assert "http" not in sentence  # no half-built link
+
+
+@pytest.mark.parametrize(
+    "code", ["missing_scope", "invalid_auth", "token_revoked", "not_allowed_token_type"]
+)
+def test_reauth_error_codes_are_detected(code: str) -> None:
+    err = SimpleNamespace(response={"error": code})
+    assert SlackChannel._reauth_error_code(err) == code  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("code", ["not_in_channel", "channel_not_found", "ratelimited"])
+def test_non_permission_errors_do_not_ask_for_reauthorization(code: str) -> None:
+    """These have different remedies (invite the bot, fix the channel, back off);
+    telling the user to reconnect Slack would be actively misleading."""
+    err = SimpleNamespace(response={"error": code})
+    assert SlackChannel._reauth_error_code(err) is None  # type: ignore[arg-type]
+
+
+def test_reauth_detection_ignores_non_slack_errors() -> None:
+    """A network blip must not be reported as a permission problem."""
+    assert SlackChannel._reauth_error_code(httpx.ConnectError("boom")) is None
+    assert SlackChannel._reauth_error_code(RuntimeError("boom")) is None
+
+
+@pytest.mark.asyncio
+async def test_denied_file_download_asks_for_permission(monkeypatch) -> None:
+    """Slack answers an unscoped url_private with 200 + its sign-in HTML, not a
+    403 — so the HTML body is the only signal that this was a denial."""
+    channel = SlackChannel(
+        SlackConfig(
+            enabled=True,
+            bot_token="xoxb-test",
+            permissions_help_url="https://app.syftdata.com/dashboard/settings/integrations?connect=slack",
+        ),
+        MessageBus(),
+    )
+
+    login_page = httpx.Response(
+        200,
+        headers={"content-type": "text/html; charset=utf-8"},
+        content=b"<!doctype html><html><title>Sign in to Slack</title>",
+    )
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return login_page
+
+    monkeypatch.setattr(
+        "nanobot.channels.slack.httpx.AsyncClient", lambda **_kwargs: _Client()
+    )
+
+    path, marker = await channel._download_slack_file(
+        {
+            "id": "F1",
+            "name": "pipeline.csv",
+            "mimetype": "text/csv",
+            "url_private": "https://files.slack.com/files-pri/T-F1/pipeline.csv",
+        }
+    )
+
+    assert path is None, "a sign-in page must never be written to disk as the file"
+    assert "files:read" in marker
+    assert "https://app.syftdata.com/dashboard/settings/integrations?connect=slack" in marker
 
 
 def test_slack_channel_uses_channel_aware_allow_policy() -> None:

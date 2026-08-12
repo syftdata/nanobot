@@ -63,6 +63,10 @@ class SlackConfig(Base):
     # preview cards under link-heavy bot posts (e.g. digests).
     unfurl_links: bool | None = None
     unfurl_media: bool | None = None
+    # Where a user should go to re-authorize the Slack app when a scope is
+    # missing. Surfaced verbatim in the model-visible marker, so the agent can
+    # hand the user a link instead of a dead end. Empty = ask without a link.
+    permissions_help_url: str = ""
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
@@ -76,6 +80,23 @@ SLACK_DOWNLOAD_TIMEOUT = 30.0
 # to websockets.connect — see slack_sdk.socket_mode.websockets.SocketModeClient.connect.
 SLACK_SOCKET_CONNECT_TIMEOUT_S = 45.0
 _HTML_DOWNLOAD_PREFIXES = (b"<!doctype html", b"<html")
+# Slack `error` codes that mean "the install is missing a scope or the token is
+# no longer good" — i.e. a human has to re-authorize the app. Deliberately
+# excludes remedies that are NOT re-authorization: `not_in_channel` (invite the
+# bot) and `channel_not_found` (wrong channel) would send the user to the wrong
+# place.
+SLACK_REAUTH_ERROR_CODES = frozenset(
+    {
+        "missing_scope",
+        "not_allowed_token_type",
+        "no_permission",
+        "restricted_action",
+        "invalid_auth",
+        "account_inactive",
+        "token_revoked",
+        "token_expired",
+    }
+)
 
 
 class SlackChannel(BaseChannel):
@@ -679,9 +700,24 @@ class SlackChannel(BaseChannel):
                     url,
                     headers={"Authorization": f"Bearer {self.config.bot_token}"},
                 )
-                response.raise_for_status()
-            if self._looks_like_html_download(response):
-                raise ValueError("Slack returned HTML instead of file content")
+            # A token without `files:read` does not get a 403 from
+            # files.slack.com — it gets a 200 carrying Slack's sign-in page. So
+            # treat an HTML body as the permission failure it is, otherwise we
+            # would write a login page to disk and call it a CSV.
+            denied = response.status_code in (401, 403) or self._looks_like_html_download(
+                response
+            )
+            if denied:
+                self.logger.warning(
+                    "Slack denied file {} ({}): missing files:read scope, or the bot "
+                    "cannot see this file",
+                    file_id,
+                    response.status_code,
+                )
+                return None, self._permission_marker(
+                    marker_type, name, "read files you upload", scope="files:read"
+                )
+            response.raise_for_status()
             path.write_bytes(response.content)
             return str(path), marker
         except Exception as e:
@@ -689,10 +725,53 @@ class SlackChannel(BaseChannel):
             return None, self._download_failure_marker(marker_type, name, "download failed")
 
     @staticmethod
-    def _download_failure_marker(marker_type: str, name: str, reason: str) -> str:
+    def _reauth_error_code(err: Exception) -> str | None:
+        """Return the Slack error code when `err` means "re-authorize the app".
+
+        slack_sdk raises SlackApiError carrying the API's `error` field. We only
+        claim a permission problem when Slack actually said so — a network blip
+        must not tell the user to go re-do OAuth.
+        """
+        response = getattr(err, "response", None)
+        code: Any = None
+        if response is not None:
+            try:
+                code = response["error"]
+            except (KeyError, TypeError):
+                code = getattr(response, "get", lambda _k: None)("error")
+        if not isinstance(code, str):
+            return None
+        return code if code in SLACK_REAUTH_ERROR_CODES else None
+
+    def _reauthorize_sentence(self, capability: str, *, scope: str = "") -> str:
+        """A user-facing ask to grant the missing Slack permission.
+
+        Goes into the model-visible content, so it has to read as something the
+        agent can say to a person — not a developer note. The old text ("Check
+        Slack files:read scope, reinstall the Slack app") told the user to go do
+        OAuth surgery with no idea where.
+        """
+        missing = f" (`{scope}`)" if scope else ""
+        ask = f"I don't have permission to {capability}{missing}."
+        if self.config.permissions_help_url:
+            return (
+                f"{ask} Ask a workspace admin to reconnect Slack here and approve the "
+                f"request: {self.config.permissions_help_url}"
+            )
+        return f"{ask} Ask a workspace admin to reconnect the Slack app with that scope."
+
+    def _permission_marker(
+        self, marker_type: str, name: str, capability: str, *, scope: str = ""
+    ) -> str:
         return (
-            f"[{marker_type}: {name}: {reason}; not available to nanobot. "
-            "Check Slack files:read scope, reinstall the Slack app, and ensure the bot can access the file.]"
+            f"[{marker_type}: {name}: not available. "
+            f"{self._reauthorize_sentence(capability, scope=scope)}]"
+        )
+
+    def _download_failure_marker(self, marker_type: str, name: str, reason: str) -> str:
+        return (
+            f"[{marker_type}: {name}: {reason}; not available. "
+            "Tell the user the upload could not be read and ask them to try re-sharing it.]"
         )
 
     @staticmethod
@@ -903,6 +982,22 @@ class SlackChannel(BaseChannel):
                 + "\n[/Thread Context]"
             )
         except Exception as e:
+            code = self._reauth_error_code(e)
+            if code:
+                # Losing thread history silently makes the agent look forgetful
+                # rather than under-permissioned. Say which one it is.
+                self.logger.warning(
+                    "Slack denied thread history for {}:{} ({}) — surfacing a "
+                    "re-authorization ask to the user",
+                    channel, thread_ts, code,
+                )
+                return (
+                    "[Thread Context unavailable] "
+                    + self._reauthorize_sentence(
+                        "read this thread's earlier messages",
+                        scope="channels:history / groups:history",
+                    )
+                )
             self.logger.warning("Failed to fetch thread context for {}:{}: {}", channel, thread_ts, e)
             return None
 
