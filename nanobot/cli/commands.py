@@ -1,12 +1,14 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
 import os
 import select
 import signal
 import sys
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -717,6 +719,74 @@ def serve(
 
 
 # ============================================================================
+# Farewell cooldown (Slack restart notices)
+# ============================================================================
+
+FAREWELL_COOLDOWN = timedelta(minutes=15)
+FAREWELL_ACTIVE_SESSION_WINDOW = timedelta(hours=2)
+FAREWELL_COOLDOWN_FILENAME = "farewell_sent.json"
+
+
+def _farewell_cooldown_path(workspace: Path) -> Path:
+    """Durable per-chat farewell timestamps under workspace/state."""
+    return workspace / "state" / FAREWELL_COOLDOWN_FILENAME
+
+
+def _load_farewell_sent(workspace: Path) -> dict[str, str]:
+    path = _farewell_cooldown_path(workspace)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        logger.debug("Failed to read farewell cooldown state from {}", path)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if k and v}
+
+
+def _save_farewell_sent(workspace: Path, data: dict[str, str]) -> None:
+    path = _farewell_cooldown_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def farewell_on_cooldown(
+    workspace: Path,
+    chat_id: str,
+    *,
+    now: datetime | None = None,
+    cooldown: timedelta = FAREWELL_COOLDOWN,
+) -> bool:
+    """True if a farewell was already sent to this Slack chat within the cooldown."""
+    raw = _load_farewell_sent(workspace).get(chat_id)
+    if not raw:
+        return False
+    try:
+        last = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return (now - last) < cooldown
+
+
+def record_farewell_sent(
+    workspace: Path,
+    chat_id: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Persist that a farewell was sent to chat_id (UTC ISO timestamp)."""
+    now = now or datetime.now(timezone.utc)
+    data = _load_farewell_sent(workspace)
+    data[chat_id] = now.astimezone(timezone.utc).isoformat()
+    _save_farewell_sent(workspace, data)
+
+
+# ============================================================================
 # Gateway / Server
 # ============================================================================
 
@@ -1141,19 +1211,20 @@ def _run_gateway(
     async def _send_farewell(reason: str = "restarting") -> None:
         """Send a brief farewell to recently-active Slack conversations.
 
-        Only targets sessions updated within the last 24 hours so dormant
-        channels don't get noisy restart notices.
+        Only targets sessions updated within the last 2 hours so dormant
+        channels don't get noisy restart notices. Also rate-limits to at most
+        one farewell per Slack chat_id per 15 minutes (crash-loop / RestartSec
+        protection); skips are logged.
         """
-        from datetime import datetime, timedelta
-        from datetime import timezone as tz
-
         from nanobot.bus.events import OutboundMessage
 
         slack_channel = channels.get_channel("slack")
         if not slack_channel or not getattr(slack_channel, "_web_client", None):
             return
 
-        cutoff = (datetime.now(tz.utc) - timedelta(hours=2)).isoformat()
+        workspace = config.workspace_path
+        now = datetime.now(timezone.utc)
+        cutoff = (now - FAREWELL_ACTIVE_SESSION_WINDOW).isoformat()
         targets: list[tuple[str, str]] = []
 
         for item in session_manager.list_sessions():
@@ -1176,10 +1247,19 @@ def _run_gateway(
             text = ":arrows_counterclockwise: I'm restarting — I'll be back in a moment."
 
         for channel_name, chat_id in targets:
+            if farewell_on_cooldown(workspace, chat_id, now=now):
+                logger.info(
+                    "Skipping farewell to {}:{} (sent within last {})",
+                    channel_name,
+                    chat_id,
+                    FAREWELL_COOLDOWN,
+                )
+                continue
             try:
                 await slack_channel.send(
                     OutboundMessage(channel=channel_name, chat_id=chat_id, content=text)
                 )
+                record_farewell_sent(workspace, chat_id, now=now)
             except Exception:
                 logger.debug("Failed to send farewell to {}:{}", channel_name, chat_id)
 
