@@ -296,6 +296,15 @@ class GatewayConfig(Base):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
+class MCPActingUserSigningConfig(Base):
+    """Per-org key for signing the chatting user into MCP request headers."""
+
+    org_id: str = ""
+    # Path to a file holding the per-org key. Read once by the gateway and
+    # protected from file/search/shell tools; the key never sits in config.
+    key_file: str = ""
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -308,6 +317,9 @@ class MCPServerConfig(Base):
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     connect_timeout: int = 60  # seconds for the initialize/list-tools handshake before giving up
+    # HTTP/SSE: sign the verified Slack sender into x-syft-acting-* headers on
+    # each tools/call (see nanobot/agent/tools/mcp_acting_user.py).
+    acting_user_signing: MCPActingUserSigningConfig | None = None
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
 
 

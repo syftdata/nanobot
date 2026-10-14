@@ -14,6 +14,11 @@ import httpx
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.mcp_acting_user import (
+    acting_user_call_meta,
+    load_signing_key,
+    make_acting_user_hook,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import (
     INBOUND_META_RUNTIME_CONTROL,
@@ -248,8 +253,16 @@ class MCPToolWrapper(_MCPWrapperBase):
 
     _plugin_discoverable = False
 
-    def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30):
+    def __init__(
+        self,
+        session,
+        server_name: str,
+        tool_def,
+        tool_timeout: int = 30,
+        acting_user_signing: Any = None,
+    ):
         self._set_mcp_connection(session, server_name)
+        self._acting_user_signing = acting_user_signing
         self._original_name = tool_def.name
         self._name = _sanitize_name(f"mcp_{server_name}_{tool_def.name}")
         self._description = tool_def.description or tool_def.name
@@ -276,10 +289,14 @@ class MCPToolWrapper(_MCPWrapperBase):
         refreshed_session = False
         while True:
             try:
-                result = await asyncio.wait_for(
-                    self._session.call_tool(self._original_name, arguments=kwargs),
-                    timeout=self._tool_timeout,
+                # A fresh one-time nonce per attempt; the transport signs it.
+                meta = acting_user_call_meta() if self._acting_user_signing else None
+                call = (
+                    self._session.call_tool(self._original_name, arguments=kwargs, meta=meta)
+                    if meta
+                    else self._session.call_tool(self._original_name, arguments=kwargs)
                 )
+                result = await asyncio.wait_for(call, timeout=self._tool_timeout)
             except asyncio.TimeoutError:
                 logger.warning(
                     "MCP tool '{}' timed out after {}s", self._name, self._tool_timeout
@@ -619,6 +636,14 @@ async def connect_mcp_servers(
                     await server_stack.aclose()
                     return name, None
 
+            request_hooks: list[Any] = [_validate_mcp_request_url]
+            signing = getattr(cfg, "acting_user_signing", None)
+            signing_key = (
+                load_signing_key(signing) if transport_type in {"sse", "streamableHttp"} else None
+            )
+            if signing_key:
+                request_hooks.append(make_acting_user_hook(signing.org_id, signing_key))
+
             if transport_type == "stdio":
                 command, args, env = _normalize_windows_stdio_command(
                     cfg.command,
@@ -650,7 +675,7 @@ async def connect_mcp_servers(
                     }
                     return httpx.AsyncClient(
                         headers=merged_headers or None,
-                        event_hooks={"request": [_validate_mcp_request_url]},
+                        event_hooks={"request": request_hooks},
                         follow_redirects=True,
                         timeout=timeout,
                         auth=auth,
@@ -668,7 +693,7 @@ async def connect_mcp_servers(
                 http_client = await server_stack.enter_async_context(
                     httpx.AsyncClient(
                         headers=cfg.headers or None,
-                        event_hooks={"request": [_validate_mcp_request_url]},
+                        event_hooks={"request": request_hooks},
                         follow_redirects=True,
                         timeout=None,
                     )
@@ -716,7 +741,13 @@ async def connect_mcp_servers(
                         name,
                     )
                     continue
-                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                wrapper = MCPToolWrapper(
+                    session,
+                    name,
+                    tool_def,
+                    tool_timeout=cfg.tool_timeout,
+                    acting_user_signing=bool(signing_key),
+                )
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
                 registered_count += 1

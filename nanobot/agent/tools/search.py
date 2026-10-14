@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, TypeVar
 
 from nanobot.agent.tools.filesystem import ListDirTool, _FsTool
+from nanobot.security.protected_paths import is_protected
 
 _DEFAULT_HEAD_LIMIT = 250
 _DEFAULT_FILE_HEAD_LIMIT = 200
@@ -109,14 +110,20 @@ class _SearchTool(_FsTool):
 
     def _iter_files(self, root: Path) -> Iterable[Path]:
         if root.is_file():
-            yield root
+            if not is_protected(root):
+                yield root
             return
 
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d not in self._IGNORE_DIRS)
             current = Path(dirpath)
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if d not in self._IGNORE_DIRS and not is_protected(current / d)
+            )
             for filename in sorted(filenames):
-                yield current / filename
+                if not is_protected(current / filename):
+                    yield current / filename
 
 
 class FindFilesTool(_SearchTool):

@@ -71,6 +71,10 @@ def resolve_allowed_path(
 ) -> Path:
     """Resolve a path and enforce containment in allowed roots when configured."""
     resolved = resolve_path(path, workspace, strict=False)
+    from nanobot.security.protected_paths import is_protected
+
+    if is_protected(resolved):
+        raise WorkspaceBoundaryError(f"Path {path} is protected and cannot be accessed")
     if allowed_root is None:
         return resolve_path(path, workspace, strict=strict) if strict else resolved
 

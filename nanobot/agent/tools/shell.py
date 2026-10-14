@@ -596,6 +596,13 @@ class ExecTool(Tool):
         cmd = command.strip()
         lower = cmd.lower()
 
+        # Gateway secrets (e.g. the MCP acting-user key file) are never
+        # readable from exec, regardless of allow_patterns.
+        from nanobot.security.protected_paths import shell_command_touches_protected
+
+        if shell_command_touches_protected(cmd):
+            return "Error: Command blocked by safety guard (protected gateway secret path)"
+
         # allow_patterns take priority over deny_patterns so that users can
         # exempt specific commands (e.g. "rm -rf" inside a build directory)
         # from the hardcoded deny list via configuration.
