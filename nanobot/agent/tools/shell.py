@@ -58,6 +58,10 @@ class ExecToolConfig(Base):
     path_prepend: str = ""
     path_append: str = ""
     sandbox: str = ""
+    # bwrap only: extra read-only / read-write mounts and a private PID ns.
+    sandbox_ro_binds: list[str] = Field(default_factory=list)
+    sandbox_binds: list[str] = Field(default_factory=list)
+    sandbox_unshare_pid: bool = False
     allowed_env_keys: list[str] = Field(default_factory=list)
     allow_patterns: list[str] = Field(default_factory=list)
     deny_patterns: list[str] = Field(default_factory=list)
@@ -151,6 +155,9 @@ class ExecTool(Tool):
             restrict_to_workspace=ctx.config.restrict_to_workspace,
             webui_allow_local_service_access=ctx.config.webui_allow_local_service_access,
             sandbox=cfg.sandbox,
+            sandbox_ro_binds=cfg.sandbox_ro_binds,
+            sandbox_binds=cfg.sandbox_binds,
+            sandbox_unshare_pid=cfg.sandbox_unshare_pid,
             path_prepend=cfg.path_prepend,
             path_append=cfg.path_append,
             allowed_env_keys=cfg.allowed_env_keys,
@@ -168,6 +175,9 @@ class ExecTool(Tool):
         webui_allow_local_service_access: bool = True,
         allow_local_preview_access: bool | None = None,
         sandbox: str = "",
+        sandbox_ro_binds: list[str] | None = None,
+        sandbox_binds: list[str] | None = None,
+        sandbox_unshare_pid: bool = False,
         path_prepend: str = "",
         path_append: str = "",
         allowed_env_keys: list[str] | None = None,
@@ -176,6 +186,9 @@ class ExecTool(Tool):
         self.timeout = timeout
         self.working_dir = working_dir
         self.sandbox = sandbox
+        self.sandbox_ro_binds = list(sandbox_ro_binds or [])
+        self.sandbox_binds = list(sandbox_binds or [])
+        self.sandbox_unshare_pid = sandbox_unshare_pid
         self.deny_patterns = (deny_patterns or []) + [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
@@ -409,7 +422,15 @@ class ExecTool(Tool):
                 )
             else:
                 workspace = workspace_root or cwd
-                command = wrap_command(self.sandbox, command, workspace, cwd)
+                command = wrap_command(
+                    self.sandbox,
+                    command,
+                    workspace,
+                    cwd,
+                    ro_binds=self.sandbox_ro_binds,
+                    rw_binds=self.sandbox_binds,
+                    unshare_pid=self.sandbox_unshare_pid,
+                )
                 cwd = str(Path(workspace).resolve())
 
         effective_timeout = self._resolve_timeout(timeout)

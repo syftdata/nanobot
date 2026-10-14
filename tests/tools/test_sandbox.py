@@ -130,3 +130,35 @@ class TestUnknownBackend:
         ws = str(tmp_path / "project")
         with pytest.raises(ValueError):
             wrap_command("", "ls", ws, ws)
+
+
+class TestBwrapExtraMounts:
+    """SYF2-5964: operator-chosen mounts and PID namespace for Syfty gateways."""
+
+    def test_extra_binds_come_after_config_mask(self, tmp_path):
+        ws = tmp_path / "org" / "workspace"
+        auth = str(tmp_path / "org" / ".config")
+        tokens = _parse(
+            wrap_command(
+                "bwrap", "gog ls", str(ws), str(ws),
+                ro_binds=["/home/linuxbrew"], rw_binds=[auth], unshare_pid=True,
+            )
+        )
+        mask = tokens.index(str(ws.parent))
+        ro = tokens.index("/home/linuxbrew")
+        rw = tokens.index(auth)
+        assert tokens[ro - 1] == "--ro-bind-try"
+        assert tokens[rw - 1] == "--bind-try"
+        assert mask < ro and mask < rw
+        assert "--unshare-pid" in tokens
+
+    def test_defaults_unchanged(self, tmp_path):
+        ws = str(tmp_path / "project")
+        tokens = _parse(wrap_command("bwrap", "ls", ws, ws))
+        assert "--unshare-pid" not in tokens
+        assert "--bind-try" not in tokens
+
+    def test_secret_paths_never_mounted_unless_listed(self, tmp_path):
+        ws = tmp_path / "org" / "workspace"
+        tokens = _parse(wrap_command("bwrap", "ls", str(ws), str(ws), ro_binds=["/usr/share"]))
+        assert not any("acting-keys" in t or t.endswith(".env") for t in tokens)
