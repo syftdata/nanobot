@@ -27,11 +27,11 @@ from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRun
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
+from nanobot.agent.tools.mcp_acting_user import set_acting_sender
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.utils.langfuse_turn import set_turn_output, turn_trace
 from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import (
@@ -63,6 +63,7 @@ from nanobot.utils.document import extract_documents, reference_non_image_attach
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
+from nanobot.utils.langfuse_turn import set_turn_output, turn_trace
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
@@ -1197,6 +1198,7 @@ class AgentLoop:
             msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
         )
         logger.info("Processing system message from {}", msg.sender_id)
+        set_acting_sender(None, None)
         key = msg.session_key_override or f"{channel}:{chat_id}"
         session = self.sessions.get_or_create(key)
         if self._restore_runtime_checkpoint(session):
@@ -1439,6 +1441,9 @@ class AgentLoop:
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+        # SYF2-5964: MCP servers that need the chatting user get it signed from
+        # the channel-verified sender, never from a tool argument.
+        set_acting_sender(msg.channel, msg.sender_id)
 
         # Session is already fetched by the caller (_process_message) but
         # ensure it exists in case this handler is invoked independently.
